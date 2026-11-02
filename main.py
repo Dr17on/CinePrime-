@@ -4,6 +4,7 @@ import os
 import time
 import resource
 import re
+import aiohttp
 
 from dotenv import load_dotenv
 load_dotenv(override=True) 
@@ -17,11 +18,12 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    InlineQueryResultArticle, InputTextMessageContent,
+    InlineQueryResultArticle, InputTextMessageContent
 )
 from aiogram.utils.deep_linking import create_start_link
 from aiogram.enums import ChatType
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 # ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -29,6 +31,7 @@ STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID", "0"))
 PUBLIC_CHANNEL_ID = int(os.getenv("PUBLIC_CHANNEL_ID", "0"))
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
 if not BOT_TOKEN or not DATABASE_URL:
     raise SystemExit("❌ Faltan BOT_TOKEN o DATABASE_URL en las variables de entorno.")
@@ -51,23 +54,35 @@ class IsAdmin(BaseFilter):
 _media_groups: dict[str, float] = {}
 
 def _is_first_in_group(group_id: str | None) -> bool:
-    if not group_id:
-        return True
+    if not group_id: return True
     now = time.time()
-    for k in [k for k, v in _media_groups.items() if now - v > 300]:
-        del _media_groups[k]
-    if group_id in _media_groups:
-        return False
+    for k in [k for k, v in _media_groups.items() if now - v > 300]: del _media_groups[k]
+    if group_id in _media_groups: return False
     _media_groups[group_id] = now
     return True
 
 # ================= AUTO-BORRADO =================
 async def delete_later(chat_id: int, message_id: int, delay: int = 600):
     await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception as e:
-        logging.warning(f"No se pudo borrar el mensaje {message_id} en {chat_id}: {e}")
+    try: await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e: logging.warning(f"No se pudo borrar msg {message_id}: {e}")
+
+# ================= TMDB INTEGRACIÓN =================
+async def fetch_tmdb_data(tipo: str, titulo: str):
+    if not TMDB_API_KEY: return None
+    # tipo: "movie" o "tv"
+    url = f"https://api.themoviedb.org/3/search/{tipo}?api_key={TMDB_API_KEY}&language=es-ES&query={titulo}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            if resp.status != 200: return None
+            data = await resp.json()
+            if not data.get("results"): return None
+            item = data["results"][0]
+            
+            # Obtener detalles completos
+            detail_url = f"https://api.themoviedb.org/3/{tipo}/{item['id']}?api_key={TMDB_API_KEY}&language=es-ES"
+            async with session.get(detail_url) as detail_resp:
+                return await detail_resp.json()
 
 # ================= CALLBACKS =================
 class SearchCB(CallbackData, prefix="srch"): code: str
@@ -76,6 +91,7 @@ class SeasonCB(CallbackData, prefix="season"): code: str
 class AdminCB(CallbackData, prefix="adm"): section: str
 class PublishCB(CallbackData, prefix="pub"): code: str
 class CheckSubCB(CallbackData, prefix="chksub"): payload: str = ""
+class TmdbSaveCB(CallbackData, prefix="tmdb"): tipo: str; tmdb_id: int; payload: str
 
 # ================= VERIFICACIÓN DE SUSCRIPCIÓN =================
 async def check_sub(user_id: int) -> bool:
@@ -126,7 +142,7 @@ async def init_db():
                 code TEXT PRIMARY KEY, title TEXT NOT NULL, description_text TEXT,
                 description_photo_id TEXT, tags TEXT DEFAULT '', content_type TEXT DEFAULT 'movie',
                 file_id TEXT, media_type TEXT, status TEXT DEFAULT 'pending',
-                public_message_id BIGINT, created_at TIMESTAMPTZ DEFAULT NOW()
+                public_message_id BIGINT, tmdb_id INT, created_at TIMESTAMPTZ DEFAULT NOW()
             );
             CREATE TABLE IF NOT EXISTS seasons (
                 code TEXT PRIMARY KEY, content_code TEXT NOT NULL REFERENCES content(code) ON DELETE CASCADE,
@@ -149,6 +165,7 @@ async def init_db():
             );
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
             ALTER TABLE content ADD COLUMN IF NOT EXISTS public_message_id BIGINT;
+            ALTER TABLE content ADD COLUMN IF NOT EXISTS tmdb_id INT;
             ALTER TABLE message_map ADD COLUMN IF NOT EXISTS used BOOLEAN DEFAULT FALSE;
             ALTER TABLE message_map ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
         """)
@@ -216,6 +233,115 @@ async def send_formatted_post(chat_id: int, code: str):
     except Exception as e:
         logging.error(f"Error enviando post {code} al chat {chat_id}: {e}")
         return False
+
+# ================= COMANDO TMDB =================
+@dp.message(Command("tmdb"), IsAdmin())
+async def cmd_tmdb(message: types.Message, command: CommandObject):
+    if not command.args:
+        return await message.answer("🎬 Uso: <code>/tmdb peli Inception</code> o <code>/tmdb serie Breaking Bad</code>\n(También puedes usar 'anime')")
+    
+    parts = command.args.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return await message.answer("⚠️ Debes indicar el tipo (peli/serie/anime) y el título.")
+    
+    tipo_raw, titulo = parts[0].lower(), parts[1]
+    tipo_tmdb = "movie" if tipo_raw in ["peli", "pelicula", "película", "movie"] else "tv"
+    
+    status_msg = await message.answer("⏳ Buscando en TMDB...")
+    
+    data = await fetch_tmdb_data(tipo_tmdb, titulo)
+    if not data:
+        return await status_msg.edit_text("❌ No se encontró el contenido en TMDB. Verifica el nombre o tu API Key.")
+        
+    nombre = data.get("title") or data.get("name")
+    sinopsis = data.get("overview") or "Sin sinopsis disponible."
+    año = (data.get("release_date") or data.get("first_air_date") or "N/A")[:4]
+    generos = ", ".join([g["name"] for g in data.get("genres", [])])
+    poster_path = data.get("poster_path")
+    tmdb_id = data["id"]
+    
+    temporadas_str = ""
+    capitulos_str = ""
+    
+    if tipo_tmdb == "tv":
+        num_temp = data.get("number_of_seasons", 0)
+        num_eps = data.get("number_of_episodes", 0)
+        temporadas_str = f"🍀Temporadas: {num_temp}\n"
+        capitulos_str = f"🍀Capítulos: {num_eps}\n"
+        encabezado = "🧃Anime:" if tipo_raw == "anime" else "🧃Serie:"
+    else:
+        encabezado = "🧃Película:"
+
+    # Construir texto exacto solicitado
+    texto = (
+        f"{encabezado} {nombre}\n"
+        f"🍀Géneros: {generos}\n"
+        f"{temporadas_str}"
+        f"{capitulos_str}"
+        f"🍀Año: {año}\n\n"
+        f"🔋Sinopsis:\n{sinopsis}\n\n"
+        f"▬ι𓆃__ ▬ι𓆃__ ▬ι𓆃 ____ ▬ι𓆃"
+    )
+
+    # Botón para publicar
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📤 Enviar al Canal de Almacenamiento", callback_data=TmdbSaveCB(tipo=tipo_tmdb, tmdb_id=tmdb_id, payload=texto).pack())
+    ]])
+
+    await status_msg.delete()
+    
+    # Enviar Póster + Texto
+    if poster_path:
+        photo_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
+        try:
+            await message.answer_photo(photo=photo_url, caption=texto, reply_markup=kb)
+            return
+        except Exception as e:
+            logging.error(f"Error enviando poster: {e}")
+            
+    # Si falla el poster o no hay, envía solo el texto
+    await message.answer(texto, reply_markup=kb)
+
+@dp.callback_query(TmdbSaveCB.filter(), IsAdmin())
+async def on_tmdb_save(query: types.CallbackQuery, callback_data: TmdbSaveCB):
+    await query.answer("Enviando al canal...")
+    
+    try:
+        if query.message.photo:
+            # Copiamos el mensaje con la foto al canal de almacenamiento
+            msg = await query.message.copy_to(chat_id=STORAGE_CHANNEL_ID)
+        else:
+            # Copiamos el mensaje de texto
+            msg = await bot.send_message(chat_id=STORAGE_CHANNEL_ID, text=query.message.text)
+    except Exception as e:
+        return await query.message.edit_text(f"❌ Error al enviar al canal: {e}")
+
+    code = f"peli_{msg.message_id}"
+    texto_completo = query.message.caption or query.message.text
+    title = texto_completo.split("\n")[0].replace("🧃Película:", "").replace("🧃Serie:", "").replace("🧃Anime:", "").strip()
+    photo_id = msg.photo[-1].file_id if msg.photo else None
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO content (code, title, description_text, description_photo_id, status, tmdb_id, content_type)
+               VALUES ($1,$2,$3,$4,'pending',$5,$6)
+               ON CONFLICT (code) DO UPDATE SET description_text=EXCLUDED.description_text""",
+            code, title, texto_completo, photo_id, callback_data.tmdb_id, callback_data.tipo
+        )
+        # Mapear la respuesta del bot en el canal
+        reply = await bot.send_message(
+            chat_id=STORAGE_CHANNEL_ID,
+            text=f"⬆️ <b>Responde a este mensaje con el video.</b>\nCódigo: <code>{code}</code>"
+        )
+        await conn.execute("INSERT INTO message_map (bot_message_id, target_code, target_type) VALUES ($1,$2,'description')", reply.message_id, code)
+
+    # Actualizar el mensaje original en el chat del admin
+    try:
+        if query.message.photo:
+            await query.message.edit_caption(caption=texto_completo + "\n\n✅ <b>Enviado al canal. Responde allí con el video.</b>", reply_markup=None)
+        else:
+            await query.message.edit_text(text=texto_completo + "\n\n✅ <b>Enviado al canal. Responde allí con el video.</b>", reply_markup=None)
+    except: pass
 
 # ================= CANAL PRIVADO =================
 @dp.channel_post(F.chat.id == STORAGE_CHANNEL_ID)
@@ -319,7 +445,7 @@ async def create_season(message: types.Message, content_code: str, season_number
     async with db_pool.acquire() as conn:
         try:
             await conn.execute("INSERT INTO seasons (code, content_code, season_number) VALUES ($1,$2,$3)", season_code, content_code, season_number)
-            await conn.execute("UPDATE content SET content_type='series' WHERE code=$1", content_code)
+            await conn.execute("UPDATE content SET content_type='series', status='ready' WHERE code=$1", content_code)
         except asyncpg.UniqueViolationError: return await message.reply(f"⚠️ Temporada {season_number} ya existe.")
 
     confirmation = await message.reply(f"✅ Temporada {season_number} creada.\nCódigo: <code>{season_code}</code>\n\n👉 Reenvía los episodios respondiendo a <b>ESTE</b> mensaje o directamente.")
@@ -359,6 +485,10 @@ async def handle_manual_link(message: types.Message):
 async def on_publish(query: types.CallbackQuery, callback_data: PublishCB):
     if PUBLIC_CHANNEL_ID == 0: return await query.answer("⚠️ Falta configurar PUBLIC_CHANNEL_ID en BotKeep.", show_alert=True)
     await query.answer("Publicando...")
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE content SET status='ready' WHERE code=$1", callback_data.code)
+        
     if await send_formatted_post(PUBLIC_CHANNEL_ID, callback_data.code): await query.message.edit_text(f"✅ <b>¡Publicado!</b>\nEl post ya está en tu canal público.")
     else: await query.message.edit_text("❌ Error al publicar. Asegúrate de que el bot es Administrador en el Canal Público.")
 
@@ -366,8 +496,14 @@ async def on_publish(query: types.CallbackQuery, callback_data: PublishCB):
 async def cmd_publicar(message: types.Message, command: CommandObject):
     if not command.args: return await message.answer("Uso: <code>/publicar codigo</code>")
     if PUBLIC_CHANNEL_ID == 0: return await message.answer("⚠️ Falta configurar PUBLIC_CHANNEL_ID en BotKeep.")
+    
+    code = command.args.strip()
     status = await message.answer("⏳ Publicando en el canal público...")
-    if await send_formatted_post(PUBLIC_CHANNEL_ID, command.args.strip()): await status.edit_text("✅ Publicado con éxito.")
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE content SET status='ready' WHERE code=$1", code)
+        
+    if await send_formatted_post(PUBLIC_CHANNEL_ID, code): await status.edit_text("✅ Publicado con éxito y estado actualizado a Listo ✅.")
     else: await status.edit_text("❌ Error al publicar.")
 
 @dp.message(Command("borrar"), IsAdmin())
@@ -384,7 +520,27 @@ async def cmd_borrar(message: types.Message, command: CommandObject):
         except Exception as e: logging.warning(f"No se pudo borrar el post {code} del canal público: {e}")
     
     async with db_pool.acquire() as conn: await conn.execute("DELETE FROM content WHERE code=$1", code)
-    await status_msg.edit_text(f"✅ <b>Contenido eliminado.</b>\nCódigo: <code>{code}</code>\n\n(Se han borrado también sus temporadas, episodios y el post del canal público si estaba publicado).")
+    await status_msg.edit_text(f"✅ <b>Contenido eliminado.</b>\nCódigo: <code>{code}</code>")
+
+@dp.message(Command("borrar_temporada"), IsAdmin())
+async def cmd_borrar_temporada(message: types.Message, command: CommandObject):
+    if not command.args: return await message.answer("🗑 Uso: <code>/borrar_temporada code_sX</code>\nEjemplo: <code>/borrar_temporada peli_123_s1</code>")
+    season_code = command.args.strip()
+    
+    async with db_pool.acquire() as conn:
+        season = await conn.fetchrow("SELECT content_code FROM seasons WHERE code=$1", season_code)
+        if not season: return await message.answer(f"❌ No se encontró la temporada <code>{season_code}</code>.")
+        
+        content_code = season["content_code"]
+        status_msg = await message.answer(f"🗑 Eliminando temporada <code>{season_code}</code> y todos sus episodios...")
+        
+        await conn.execute("DELETE FROM seasons WHERE code=$1", season_code)
+        
+        remaining = await conn.fetchval("SELECT COUNT(*) FROM seasons WHERE content_code=$1", content_code)
+        if remaining == 0:
+            await conn.execute("UPDATE content SET content_type='movie' WHERE code=$1", content_code)
+            
+    await status_msg.edit_text(f"✅ <b>Temporada eliminada.</b>\nCódigo: <code>{season_code}</code>\n\n(Todos sus episodios fueron borrados).\n" + ("La serie se ha quedado sin temporadas, puedes borrarla con <code>/borrar " + content_code + "</code>." if remaining == 0 else ""))
 
 @dp.message(Command("borrar_episodio"), IsAdmin())
 async def cmd_borrar_episodio(message: types.Message, command: CommandObject):
@@ -541,8 +697,8 @@ async def favs(message: types.Message):
 ADMIN_SECTIONS = {
     "guia": (
         "📝 <b>CÓMO PUBLICAR CONTENIDO</b>\n\n"
-        "<b>🎬 Película en 1 post</b>\nReenvía al canal privado un post que ya tenga <b>video + descripción</b>.\n\n"
-        "<b>🎬 Película en 2 pasos</b>\n1. Reenvía la descripción (texto o foto) → obtienes código.\n2. Reenvía el video respondiendo al mensaje del bot.\n\n"
+        "<b>🪄 CON TMDB (Automático)</b>\nUsa <code>/tmdb peli Inception</code> o <code>/tmdb serie Breaking Bad</code>. El bot buscará el póster y la sinopsis, armará el post y te dará un botón para enviarlo al canal de almacenamiento.\n\n"
+        "<b>🎬 Película en 2 pasos (Manual)</b>\n1. Reenvía la descripción (texto o foto) → obtienes código.\n2. Reenvía el video respondiendo al mensaje del bot.\n\n"
         "<b>📺 Serie con temporadas</b>\n1. Reenvía la descripción → obtienes <code>peli_XXX</code>.\n2. Responde al bot con <code>/season 1</code>.\n3. Reenvía los episodios respondiendo a ese mensaje.\n4. Repite con <code>/season 2</code>, etc.\n\n"
         "⚠️ Si te equivocas, envía <code>/cancelar</code> en el canal privado para detener el proceso."
     ),
@@ -563,8 +719,9 @@ ADMIN_SECTIONS = {
     ),
     "borrar": (
         "🗑 <b>ELIMINAR CONTENIDO</b>\n\n"
-        "<b>/borrar codigo</b>\nElimina una película o serie de la base de datos y <b>también borra el post del canal público</b> si estaba publicado.\n<i>Ejemplo:</i> <code>/borrar peli_123</code>\n\n"
-        "<b>/borrar_episodio code_sX num</b>\nElimina un episodio específico de una temporada y <b>reordena automáticamente</b> los siguientes.\n<i>Ejemplo:</i> <code>/borrar_episodio peli_123_s1 2</code>"
+        "<b>/borrar codigo</b>\nElimina una película o serie <b>completa</b> de la base de datos y borra el post del canal público.\n<i>Ejemplo:</i> <code>/borrar peli_123</code>\n\n"
+        "<b>/borrar_temporada code_sX</b>\nElimina una temporada completa y todos sus capítulos de golpe.\n<i>Ejemplo:</i> <code>/borrar_temporada peli_123_s1</code>\n\n"
+        "<b>/borrar_episodio code_sX num</b>\nElimina un episodio específico y <b>reordena</b> los siguientes.\n<i>Ejemplo:</i> <code>/borrar_episodio peli_123_s1 2</code>"
     ),
     "bienvenida": (
         "👋 <b>MENSAJE DE BIENVENIDA</b>\n\nConfigura el mensaje que verán los usuarios en <code>/start</code>. Puedes usar HTML y enlaces.\n\nPulsa en el botón para editarlo."
@@ -777,17 +934,28 @@ async def log_memory():
 async def validate_file_ids():
     while True:
         await asyncio.sleep(6 * 3600)
-        logging.info("🔍 Validando file_ids...")
+        logging.info("🔍 Validando file_ids... (Modo seguro: no se borrará nada automáticamente)")
         async with db_pool.acquire() as conn:
             for row in await conn.fetch("SELECT code, file_id FROM content WHERE file_id IS NOT NULL"):
-                try: await bot.get_file(row["file_id"])
-                except:
+                try: 
+                    await bot.get_file(row["file_id"])
+                    await asyncio.sleep(0.3)
+                except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
+                except TelegramBadRequest:
                     await conn.execute("UPDATE content SET status='invalid' WHERE code=$1", row["code"])
-                    try: await bot.send_message(ADMIN_ID, f"⚠️ file_id inválido en <code>{row['code']}</code>")
+                    try: await bot.send_message(ADMIN_ID, f"⚠️ El archivo de la película <code>{row['code']}</code> ha caducado o es inválido.")
                     except: pass
-            for row in await conn.fetch("SELECT id, file_id FROM episodes"):
-                try: await bot.get_file(row["file_id"])
-                except: await conn.execute("DELETE FROM episodes WHERE id=$1", row["id"])
+                except Exception as e: logging.warning(f"Error temporal validando peli {row['code']}: {e}")
+            
+            for row in await conn.fetch("SELECT id, season_code, episode_number, file_id FROM episodes"):
+                try: 
+                    await bot.get_file(row["file_id"])
+                    await asyncio.sleep(0.3)
+                except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
+                except TelegramBadRequest:
+                    try: await bot.send_message(ADMIN_ID, f"⚠️ El archivo del episodio {row['episode_number']} de <code>{row['season_code']}</code> es inválido. Usa /borrar_episodio si quieres eliminarlo.")
+                    except: pass
+                except Exception as e: logging.warning(f"Error temporal validando episodio {row['id']}: {e}")
         logging.info("✅ Validación completa.")
 
 # ================= ARRANQUE =================
