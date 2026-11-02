@@ -12,6 +12,8 @@ import asyncpg
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command, CommandObject, BaseFilter
 from aiogram.filters.callback_data import CallbackData
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     InlineQueryResultArticle, InputTextMessageContent,
@@ -33,6 +35,10 @@ if not BOT_TOKEN or not DATABASE_URL:
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 db_pool: asyncpg.Pool = None
+
+# ================= ESTADOS (FSM) =================
+class AdminStates(StatesGroup):
+    waiting_for_welcome = State()
 
 # ================= FILTROS =================
 class IsAdmin(BaseFilter):
@@ -59,6 +65,53 @@ class FavToggleCB(CallbackData, prefix="fav"): code: str
 class SeasonCB(CallbackData, prefix="season"): code: str
 class AdminCB(CallbackData, prefix="adm"): section: str
 class PublishCB(CallbackData, prefix="pub"): code: str
+class CheckSubCB(CallbackData, prefix="chksub"): payload: str = ""
+
+# ================= VERIFICACIÓN DE SUSCRIPCIÓN =================
+async def check_sub(user_id: int) -> bool:
+    if PUBLIC_CHANNEL_ID == 0:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=PUBLIC_CHANNEL_ID, user_id=user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except Exception as e:
+        logging.error(f"Error verificando suscripción de {user_id}: {e}")
+        return False
+
+async def send_join_message(event, payload: str = ""):
+    try:
+        chat = await bot.get_chat(PUBLIC_CHANNEL_ID)
+        if chat.invite_link: link = chat.invite_link
+        elif chat.username: link = f"https://t.me/{chat.username}"
+        else: link = "https://t.me/TuCanalPrincipal"
+    except: link = "https://t.me/TuCanalPrincipal"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Unirse al Canal", url=link)],
+        [InlineKeyboardButton(text="✅ Ya me uní", callback_data=CheckSubCB(payload=payload).pack())]
+    ])
+    
+    text = (
+        "🔒 <b>ACCESO RESTRINGIDO</b>\n\n"
+        "Para poder ver las películas y series, primero debes estar suscrito a nuestro canal principal.\n\n"
+        "👉 Únete al canal y luego pulsa el botón <b>✅ Ya me uní</b>."
+    )
+    
+    if isinstance(event, types.CallbackQuery):
+        await event.message.answer(text, reply_markup=kb)
+        await event.answer("Debes suscribirte al canal primero.", show_alert=True)
+    else:
+        await event.answer(text, reply_markup=kb)
+
+@dp.callback_query(CheckSubCB.filter())
+async def on_check_sub(query: types.CallbackQuery, callback_data: CheckSubCB):
+    if await check_sub(query.from_user.id):
+        await query.message.delete()
+        await query.message.answer("✅ <b>¡Gracias por unirte!</b> Ya tienes acceso completo al bot.\n\nEscribe /start para comenzar.")
+        if callback_data.payload:
+            await deliver_by_code(query.from_user.id, callback_data.payload)
+    else:
+        await query.answer("❌ Aún no estás suscrito. Por favor, únete al canal primero.", show_alert=True)
 
 # ================= DB =================
 async def init_db():
@@ -76,6 +129,7 @@ async def init_db():
                 file_id TEXT,
                 media_type TEXT,
                 status TEXT DEFAULT 'pending',
+                public_message_id BIGINT,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
             CREATE TABLE IF NOT EXISTS seasons (
@@ -112,6 +166,11 @@ async def init_db():
                 used BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            ALTER TABLE content ADD COLUMN IF NOT EXISTS public_message_id BIGINT;
             ALTER TABLE message_map ADD COLUMN IF NOT EXISTS used BOOLEAN DEFAULT FALSE;
             ALTER TABLE message_map ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
         """)
@@ -174,9 +233,13 @@ async def send_formatted_post(chat_id: int, code: str):
 
     try:
         if photo:
-            await bot.send_photo(chat_id, photo=photo, caption=text, reply_markup=kb)
+            msg = await bot.send_photo(chat_id, photo=photo, caption=text, reply_markup=kb)
         elif text:
-            await bot.send_message(chat_id, text=text, reply_markup=kb)
+            msg = await bot.send_message(chat_id, text=text, reply_markup=kb)
+        
+        if chat_id == PUBLIC_CHANNEL_ID and msg:
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE content SET public_message_id=$1 WHERE code=$2", msg.message_id, code)
         return True
     except Exception as e:
         logging.error(f"Error enviando post {code} al chat {chat_id}: {e}")
@@ -187,17 +250,14 @@ async def send_formatted_post(chat_id: int, code: str):
 async def handle_storage(message: types.Message):
     text = message.text or message.caption or ""
     
-    # 1. Interceptar comandos PRIMERO
     if text.lower().startswith("/season"):
         return await handle_season_command(message)
     if text.lower().startswith("/link"):
         return await handle_manual_link(message)
 
-    # 2. Si es video/documento
     if message.video or message.document:
         return await handle_content(message)
         
-    # 3. Si es texto/foto (Descripción)
     if message.text or message.photo:
         if not _is_first_in_group(message.media_group_id):
             return
@@ -342,20 +402,19 @@ async def handle_manual_link(message: types.Message):
         if content: return await add_movie(message, code)
     await message.reply(f"❌ Código <code>{code}</code> no encontrado.")
 
-# ================= PUBLICACIÓN AL CANAL PÚBLICO =================
+# ================= PUBLICACIÓN Y BORRADO =================
 @dp.callback_query(PublishCB.filter(), IsAdmin())
 async def on_publish(query: types.CallbackQuery, callback_data: PublishCB):
     if PUBLIC_CHANNEL_ID == 0:
         return await query.answer("⚠️ Falta configurar PUBLIC_CHANNEL_ID en BotKeep.", show_alert=True)
     
     await query.answer("Publicando...")
-    
     success = await send_formatted_post(PUBLIC_CHANNEL_ID, callback_data.code)
     
     if success:
         await query.message.edit_text(f"✅ <b>¡Publicado!</b>\nEl post ya está en tu canal público.")
     else:
-        await query.message.edit_text("❌ Error al publicar. Asegúrate de que el bot es Administrador en el Canal Público y que el ID es correcto.")
+        await query.message.edit_text("❌ Error al publicar. Asegúrate de que el bot es Administrador en el Canal Público.")
 
 @dp.message(Command("publicar"), IsAdmin())
 async def cmd_publicar(message: types.Message, command: CommandObject):
@@ -369,6 +428,32 @@ async def cmd_publicar(message: types.Message, command: CommandObject):
         await status.edit_text("✅ Publicado con éxito en el canal público.")
     else:
         await status.edit_text("❌ Error al publicar.")
+
+@dp.message(Command("borrar"), IsAdmin())
+async def cmd_borrar(message: types.Message, command: CommandObject):
+    if not command.args:
+        return await message.answer("🗑 Uso: <code>/borrar codigo</code>\nEjemplo: <code>/borrar peli_123</code>")
+    
+    code = command.args.strip()
+    async with db_pool.acquire() as conn:
+        content = await conn.fetchrow("SELECT code, public_message_id FROM content WHERE code=$1", code)
+    
+    if not content:
+        return await message.answer("❌ Código no encontrado en la base de datos.")
+    
+    status_msg = await message.answer(f"🗑 Eliminando <code>{code}</code>...")
+    
+    if content["public_message_id"] and PUBLIC_CHANNEL_ID != 0:
+        try:
+            await bot.delete_message(chat_id=PUBLIC_CHANNEL_ID, message_id=content["public_message_id"])
+            logging.info(f"Post {code} eliminado del canal público.")
+        except Exception as e:
+            logging.warning(f"No se pudo borrar el post {code} del canal público: {e}")
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM content WHERE code=$1", code)
+    
+    await status_msg.edit_text(f"✅ <b>Contenido eliminado.</b>\nCódigo: <code>{code}</code>\n\n(Se han borrado también sus temporadas, episodios y el post del canal público si estaba publicado).")
 
 # ================= ENTREGA AL USUARIO =================
 async def deliver_description(chat_id: int, content):
@@ -424,18 +509,35 @@ async def deliver_episodes(chat_id: int, season_code: str):
 @dp.message(CommandStart(deep_link=True))
 async def start_deep(message: types.Message, command: CommandObject):
     await register_user(message.from_user)
-    if command.args: await deliver_by_code(message.chat.id, command.args)
+    if not await check_sub(message.from_user.id):
+        return await send_join_message(message, command.args)
+    if command.args: 
+        await deliver_by_code(message.chat.id, command.args)
 
 @dp.message(CommandStart())
 async def start(message: types.Message):
     await register_user(message.from_user)
-    await message.answer("👋 ¡Hola!\n\n🎬 Pulsa los botones del canal.\n🔍 Escribe el título o usa /buscar.\n⭐ /favoritos")
+    if not await check_sub(message.from_user.id):
+        return await send_join_message(message)
+    
+    # Obtener mensaje de bienvenida personalizado
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM settings WHERE key='welcome_message'")
+    
+    if row and row["value"]:
+        await message.answer(row["value"])
+    else:
+        # Mensaje por defecto si no has configurado ninguno
+        await message.answer("👋 ¡Hola!\n\n🎬 Pulsa los botones del canal.\n🔍 Escribe el título o usa /buscar.\n⭐ /favoritos\n\n<i>(El administrador puede cambiar este mensaje desde el panel /admin)</i>")
 
 async def build_search(query: str):
     async with db_pool.acquire() as conn:
         return await conn.fetch("SELECT code, title FROM content WHERE status='ready' AND (title ILIKE $1 OR tags ILIKE $1) LIMIT 20", f"%{query}%")
 
 async def send_results(message: types.Message, query: str):
+    if not await check_sub(message.from_user.id):
+        return await send_join_message(message)
+        
     rows = await build_search(query)
     if not rows: return await message.answer(f"🔍 Sin resultados para «{query}».")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"🎬 {r['title'][:50]}", callback_data=SearchCB(code=r["code"]).pack())] for r in rows])
@@ -444,21 +546,33 @@ async def send_results(message: types.Message, query: str):
 @dp.message(Command("buscar"))
 async def buscar(message: types.Message, command: CommandObject):
     await register_user(message.from_user)
-    if not command.args: return await message.answer("🔍 Uso: <code>/buscar nombre</code>")
+    if not command.args: 
+        if not await check_sub(message.from_user.id):
+            return await send_join_message(message)
+        return await message.answer("🔍 Uso: <code>/buscar nombre</code>")
     await send_results(message, command.args)
 
 @dp.message(F.text & ~F.text.startswith("/") & (F.chat.type == ChatType.PRIVATE))
-async def text_search(message: types.Message):
+async def text_search(message: types.Message, state: FSMContext):
+    # Evitar que el buscador interfiera si el admin está escribiendo la bienvenida
+    current_state = await state.get_state()
+    if current_state == AdminStates.waiting_for_welcome.state:
+        return 
+
     await register_user(message.from_user)
     await send_results(message, message.text)
 
 @dp.callback_query(SearchCB.filter())
 async def on_search(query: types.CallbackQuery, callback_data: SearchCB):
+    if not await check_sub(query.from_user.id):
+        return await send_join_message(query, callback_data.code)
     await query.answer()
     await deliver_by_code(query.from_user.id, callback_data.code)
 
 @dp.callback_query(SeasonCB.filter())
 async def on_season(query: types.CallbackQuery, callback_data: SeasonCB):
+    if not await check_sub(query.from_user.id):
+        return await send_join_message(query, callback_data.code)
     await query.answer()
     await deliver_by_code(query.from_user.id, callback_data.code)
 
@@ -479,6 +593,9 @@ async def inline_search(query: types.InlineQuery):
 # ================= FAVORITOS =================
 @dp.callback_query(FavToggleCB.filter())
 async def toggle_fav(query: types.CallbackQuery, callback_data: FavToggleCB):
+    if not await check_sub(query.from_user.id):
+        return await send_join_message(query, callback_data.code)
+        
     uid, code = query.from_user.id, callback_data.code
     async with db_pool.acquire() as conn:
         exists = await conn.fetchrow("SELECT 1 FROM favorites WHERE user_id=$1 AND code=$2", uid, code)
@@ -492,6 +609,9 @@ async def toggle_fav(query: types.CallbackQuery, callback_data: FavToggleCB):
 
 @dp.message(Command("favoritos"))
 async def favs(message: types.Message):
+    if not await check_sub(message.from_user.id):
+        return await send_join_message(message)
+        
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT m.code, m.title FROM favorites f JOIN content m ON m.code=f.code WHERE f.user_id=$1 AND m.status='ready'", message.from_user.id)
     if not rows: return await message.answer("⭐ Sin favoritos.")
@@ -517,8 +637,7 @@ ADMIN_SECTIONS = {
     "pelis": (
         "🎬 <b>COMANDOS DE PELÍCULAS</b>\n\n"
         "<b>/link codigo</b>\n"
-        "Responde a un video con este comando para vincularlo manualmente "
-        "a una película ya creada.\n"
+        "Responde a un video con este comando para vincularlo manualmente a una película ya creada.\n"
         "<i>Ejemplo:</i> responde al video con <code>/link peli_123</code>\n\n"
         "🔗 <b>Enlace generado:</b>\n"
         "<code>https://t.me/TuBot?start=peli_123</code>\n\n"
@@ -533,11 +652,9 @@ ADMIN_SECTIONS = {
         "<i>Ejemplo:</i> <code>/season 1</code>, <code>/season 2</code>...\n\n"
         "🔗 <b>Enlace generado por temporada:</b>\n"
         "<code>https://t.me/TuBot?start=peli_XXX_s1</code>\n\n"
-        "Al pulsar el de una temporada, el bot envía <b>todos los episodios de esa "
-        "temporada, en orden, uno tras otro</b>. No mezcla temporadas.\n\n"
+        "Al pulsar el de una temporada, el bot envía <b>todos los episodios de esa temporada, en orden, uno tras otro</b>. No mezcla temporadas.\n\n"
         "📢 <b>Publicar:</b>\n"
-        "Puedes publicar en el canal público en cuanto crees la Temporada 1, o usar "
-        "<code>/publicar peli_XXX</code> más tarde para actualizar el post con las nuevas temporadas."
+        "Puedes publicar en el canal público en cuanto crees la Temporada 1, o usar <code>/publicar peli_XXX</code> más tarde para actualizar el post con las nuevas temporadas."
     ),
     "enlaces": (
         "🔗 <b>ENLACES Y BOTONES</b>\n\n"
@@ -551,6 +668,20 @@ ADMIN_SECTIONS = {
         "<b>/restaurar ID_CANAL</b>\n"
         "Si tu canal principal es baneado, usa esto para enviar TODOS los posts de golpe a tu nuevo canal.\n"
         "<i>Ejemplo:</i> <code>/restaurar -1001234567890</code>"
+    ),
+    "borrar": (
+        "🗑 <b>ELIMINAR CONTENIDO</b>\n\n"
+        "<b>/borrar codigo</b>\n"
+        "Elimina un contenido de la base de datos y, si estaba publicado en el canal público, <b>también elimina el post del canal</b>.\n\n"
+        "Si es una serie, borrará también sus temporadas y todos sus episodios automáticamente.\n\n"
+        "<i>Ejemplo:</i> <code>/borrar peli_123</code>\n\n"
+        "⚠️ <b>Esta acción no se puede deshacer.</b> Usa <code>/lista</code> para ver los códigos antes de borrar."
+    ),
+    "bienvenida": (
+        "👋 <b>MENSAJE DE BIENVENIDA</b>\n\n"
+        "Aquí puedes configurar el mensaje que verán los usuarios cuando escriban <code>/start</code> en el bot.\n\n"
+        "Puedes usar formato HTML (ej: <code>&lt;b&gt;texto&lt;/b&gt;</code> para negrita, <code>&lt;i&gt;texto&lt;/i&gt;</code> para cursiva) e incluir enlaces.\n\n"
+        "Pulsa en el botón de abajo para escribir el nuevo mensaje."
     ),
     "msgs": (
         "📣 <b>NOTIFICACIONES Y AVISOS</b>\n\n"
@@ -584,6 +715,10 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📢 Post/Restaurar", callback_data=AdminCB(section="post").pack()),
         ],
         [
+            InlineKeyboardButton(text="🗑 Borrar Contenido", callback_data=AdminCB(section="borrar").pack()),
+            InlineKeyboardButton(text="👋 Bienvenida", callback_data=AdminCB(section="bienvenida").pack()),
+        ],
+        [
             InlineKeyboardButton(text="📣 Mensajes", callback_data=AdminCB(section="msgs").pack()),
             InlineKeyboardButton(text="📊 Stats",    callback_data=AdminCB(section="stats").pack()),
         ],
@@ -594,25 +729,71 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
 def back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Volver al panel", callback_data=AdminCB(section="menu").pack())],[InlineKeyboardButton(text="❌ Cerrar", callback_data=AdminCB(section="close").pack())]])
 
+# --- BOTÓN EDITAR BIENVENIDA ---
+def welcome_edit_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Escribir nuevo mensaje", callback_data=AdminCB(section="edit_welcome").pack())],
+        [InlineKeyboardButton(text="◀️ Volver al panel", callback_data=AdminCB(section="menu").pack())]
+    ])
+
 @dp.message(Command("admin"), IsAdmin())
 async def admin_panel(message: types.Message):
     await message.answer("🛠 <b>PANEL DE ADMINISTRADOR</b>\n\nToca una categoría para ver los comandos y su explicación:", reply_markup=admin_panel_kb())
 
 @dp.callback_query(AdminCB.filter(), IsAdmin())
-async def admin_callback(query: types.CallbackQuery, callback_data: AdminCB):
+async def admin_callback(query: types.CallbackQuery, callback_data: AdminCB, state: FSMContext):
     section = callback_data.section
+    
     if section == "close":
         await query.answer()
         try: await query.message.delete()
         except: pass
         return
+        
     if section == "menu":
         await query.answer()
         return await query.message.edit_text("🛠 <b>PANEL DE ADMINISTRADOR</b>\n\nToca una categoría para ver los comandos y su explicación:", reply_markup=admin_panel_kb())
+
+    if section == "edit_welcome":
+        await query.answer()
+        await state.set_state(AdminStates.waiting_for_welcome)
+        return await query.message.edit_text(
+            "✏️ <b>Envía el nuevo mensaje de bienvenida</b>\n\n"
+            "Puedes usar formato HTML y emojis. Envíalo en el siguiente mensaje.\n\n"
+            "Para cancelar, envía /cancelar",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data=AdminCB(section="menu").pack())]])
+        )
+
     text = ADMIN_SECTIONS.get(section)
     if not text: return await query.answer("Sección no encontrada.", show_alert=True)
+    
     await query.answer()
-    await query.message.edit_text(text, reply_markup=back_kb())
+    
+    # Si entra en la sección de bienvenida, mostramos el botón de editar
+    if section == "bienvenida":
+        await query.message.edit_text(text, reply_markup=welcome_edit_kb())
+    else:
+        await query.message.edit_text(text, reply_markup=back_kb())
+
+# ================= RECIBIR NUEVA BIENVENIDA =================
+@dp.message(AdminStates.waiting_for_welcome, IsAdmin())
+async def process_new_welcome(message: types.Message, state: FSMContext):
+    if message.text == "/cancelar":
+        await state.clear()
+        return await message.answer("❌ Edición cancelada.", reply_markup=admin_panel_kb())
+
+    new_text = message.html_text # Usa html_text para conservar negritas y enlaces
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('welcome_message', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            new_text
+        )
+    
+    await state.clear()
+    await message.answer("✅ <b>Mensaje de bienvenida actualizado.</b>\n\nAsí lo verán los usuarios:", reply_markup=admin_panel_kb())
+    await message.answer(new_text)
 
 # ================= RESTAURACIÓN Y OTROS COMANDOS ADMIN =================
 @dp.message(Command("restaurar"), IsAdmin())
