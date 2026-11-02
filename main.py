@@ -61,6 +61,15 @@ def _is_first_in_group(group_id: str | None) -> bool:
     _media_groups[group_id] = now
     return True
 
+# ================= AUTO-BORRADO =================
+async def delete_later(chat_id: int, message_id: int, delay: int = 600):
+    """Espera X segundos y borra el mensaje en el PV del usuario"""
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logging.warning(f"No se pudo borrar el mensaje {message_id} en {chat_id}: {e}")
+
 # ================= CALLBACKS =================
 class SearchCB(CallbackData, prefix="srch"): code: str
 class FavToggleCB(CallbackData, prefix="fav"): code: str
@@ -71,8 +80,7 @@ class CheckSubCB(CallbackData, prefix="chksub"): payload: str = ""
 
 # ================= VERIFICACIÓN DE SUSCRIPCIÓN =================
 async def check_sub(user_id: int) -> bool:
-    if PUBLIC_CHANNEL_ID == 0:
-        return True
+    if PUBLIC_CHANNEL_ID == 0: return True
     try:
         member = await bot.get_chat_member(chat_id=PUBLIC_CHANNEL_ID, user_id=user_id)
         return member.status in ["member", "administrator", "creator"]
@@ -92,12 +100,7 @@ async def send_join_message(event, payload: str = ""):
         [InlineKeyboardButton(text="📢 Unirse al Canal", url=link)],
         [InlineKeyboardButton(text="✅ Ya me uní", callback_data=CheckSubCB(payload=payload).pack())]
     ])
-    
-    text = (
-        "🔒 <b>ACCESO RESTRINGIDO</b>\n\n"
-        "Para poder ver las películas y series, primero debes estar suscrito a nuestro canal principal.\n\n"
-        "👉 Únete al canal y luego pulsa el botón <b>✅ Ya me uní</b>."
-    )
+    text = ("🔒 <b>ACCESO RESTRINGIDO</b>\n\nPara poder ver las películas y series, primero debes estar suscrito a nuestro canal principal.\n\n👉 Únete al canal y luego pulsa el botón <b>✅ Ya me uní</b>.")
     
     if isinstance(event, types.CallbackQuery):
         await event.message.answer(text, reply_markup=kb)
@@ -110,8 +113,7 @@ async def on_check_sub(query: types.CallbackQuery, callback_data: CheckSubCB):
     if await check_sub(query.from_user.id):
         await query.message.delete()
         await query.message.answer("✅ <b>¡Gracias por unirte!</b> Ya tienes acceso completo al bot.\n\nEscribe /start para comenzar.")
-        if callback_data.payload:
-            await deliver_by_code(query.from_user.id, callback_data.payload)
+        if callback_data.payload: await deliver_by_code(query.from_user.id, callback_data.payload)
     else:
         await query.answer("❌ Aún no estás suscrito. Por favor, únete al canal primero.", show_alert=True)
 
@@ -122,56 +124,31 @@ async def init_db():
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS content (
-                code TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                description_text TEXT,
-                description_photo_id TEXT,
-                tags TEXT DEFAULT '',
-                content_type TEXT DEFAULT 'movie',
-                file_id TEXT,
-                media_type TEXT,
-                status TEXT DEFAULT 'pending',
-                public_message_id BIGINT,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                code TEXT PRIMARY KEY, title TEXT NOT NULL, description_text TEXT,
+                description_photo_id TEXT, tags TEXT DEFAULT '', content_type TEXT DEFAULT 'movie',
+                file_id TEXT, media_type TEXT, status TEXT DEFAULT 'pending',
+                public_message_id BIGINT, created_at TIMESTAMPTZ DEFAULT NOW()
             );
             CREATE TABLE IF NOT EXISTS seasons (
-                code TEXT PRIMARY KEY,
-                content_code TEXT NOT NULL REFERENCES content(code) ON DELETE CASCADE,
-                season_number INTEGER NOT NULL,
-                UNIQUE(content_code, season_number)
+                code TEXT PRIMARY KEY, content_code TEXT NOT NULL REFERENCES content(code) ON DELETE CASCADE,
+                season_number INTEGER NOT NULL, UNIQUE(content_code, season_number)
             );
             CREATE TABLE IF NOT EXISTS episodes (
-                id SERIAL PRIMARY KEY,
-                season_code TEXT NOT NULL REFERENCES seasons(code) ON DELETE CASCADE,
-                episode_number INTEGER NOT NULL,
-                file_id TEXT NOT NULL,
-                media_type TEXT NOT NULL,
-                title TEXT,
+                id SERIAL PRIMARY KEY, season_code TEXT NOT NULL REFERENCES seasons(code) ON DELETE CASCADE,
+                episode_number INTEGER NOT NULL, file_id TEXT NOT NULL, media_type TEXT NOT NULL, title TEXT,
                 UNIQUE(season_code, episode_number)
             );
             CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                joined_at TIMESTAMPTZ DEFAULT NOW()
+                user_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT, joined_at TIMESTAMPTZ DEFAULT NOW()
             );
             CREATE TABLE IF NOT EXISTS favorites (
-                user_id BIGINT,
-                code TEXT,
-                added_at TIMESTAMPTZ DEFAULT NOW(),
-                PRIMARY KEY (user_id, code)
+                user_id BIGINT, code TEXT, added_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY (user_id, code)
             );
             CREATE TABLE IF NOT EXISTS message_map (
-                bot_message_id BIGINT PRIMARY KEY,
-                target_code TEXT NOT NULL,
-                target_type TEXT NOT NULL,
-                used BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                bot_message_id BIGINT PRIMARY KEY, target_code TEXT NOT NULL, target_type TEXT NOT NULL,
+                used BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW()
             );
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
             ALTER TABLE content ADD COLUMN IF NOT EXISTS public_message_id BIGINT;
             ALTER TABLE message_map ADD COLUMN IF NOT EXISTS used BOOLEAN DEFAULT FALSE;
             ALTER TABLE message_map ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
@@ -179,11 +156,7 @@ async def init_db():
 
 async def register_user(user: types.User):
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO users (user_id, username, first_name) VALUES ($1,$2,$3) "
-            "ON CONFLICT (user_id) DO NOTHING",
-            user.id, user.username, user.first_name,
-        )
+        await conn.execute("INSERT INTO users (user_id, username, first_name) VALUES ($1,$2,$3) ON CONFLICT (user_id) DO NOTHING", user.id, user.username, user.first_name)
 
 # ================= HELPERS DE LINKING =================
 async def get_target_by_msg_id(bot_msg_id: int):
@@ -192,11 +165,7 @@ async def get_target_by_msg_id(bot_msg_id: int):
 
 async def get_recent_pending():
     async with db_pool.acquire() as conn:
-        return await conn.fetchrow("""
-            SELECT target_code, target_type FROM message_map
-            WHERE used = FALSE AND created_at > NOW() - INTERVAL '10 minutes'
-            ORDER BY created_at DESC LIMIT 1
-        """)
+        return await conn.fetchrow("SELECT target_code, target_type FROM message_map WHERE used = FALSE AND created_at > NOW() - INTERVAL '10 minutes' ORDER BY created_at DESC LIMIT 1")
 
 async def mark_used(target_code: str, target_type: str):
     async with db_pool.acquire() as conn:
@@ -211,7 +180,6 @@ async def generate_post_kb(code: str):
     async with db_pool.acquire() as conn:
         content = await conn.fetchrow("SELECT content_type FROM content WHERE code=$1", code)
         if not content: return None
-        
         buttons = []
         if content["content_type"] == "movie":
             link = await create_start_link(bot, payload=code, encode=False)
@@ -221,7 +189,6 @@ async def generate_post_kb(code: str):
             for s in seasons:
                 link = await create_start_link(bot, payload=s["code"], encode=False)
                 buttons.append([InlineKeyboardButton(text=f"🎬 Temporada {s['season_number']}", url=link)])
-        
         return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
 async def send_formatted_post(chat_id: int, code: str):
@@ -234,10 +201,8 @@ async def send_formatted_post(chat_id: int, code: str):
     photo = content["description_photo_id"]
 
     try:
-        if photo:
-            msg = await bot.send_photo(chat_id, photo=photo, caption=text, reply_markup=kb)
-        elif text:
-            msg = await bot.send_message(chat_id, text=text, reply_markup=kb)
+        if photo: msg = await bot.send_photo(chat_id, photo=photo, caption=text, reply_markup=kb)
+        elif text: msg = await bot.send_message(chat_id, text=text, reply_markup=kb)
         
         if chat_id == PUBLIC_CHANNEL_ID and msg:
             async with db_pool.acquire() as conn:
@@ -245,13 +210,9 @@ async def send_formatted_post(chat_id: int, code: str):
                 
             async with db_pool.acquire() as conn:
                 sticker_row = await conn.fetchrow("SELECT value FROM settings WHERE key='post_sticker'")
-            
             if sticker_row and sticker_row["value"]:
-                try:
-                    await bot.send_sticker(chat_id, sticker=sticker_row["value"])
-                except Exception as e:
-                    logging.warning(f"No se pudo enviar el sticker: {e}")
-            
+                try: await bot.send_sticker(chat_id, sticker=sticker_row["value"])
+                except Exception as e: logging.warning(f"No se pudo enviar el sticker: {e}")
         return True
     except Exception as e:
         logging.error(f"Error enviando post {code} al chat {chat_id}: {e}")
@@ -260,21 +221,20 @@ async def send_formatted_post(chat_id: int, code: str):
 # ================= CANAL PRIVADO =================
 @dp.channel_post(F.chat.id == STORAGE_CHANNEL_ID)
 async def handle_storage(message: types.Message):
-    # .strip() elimina espacios en blanco invisibles al principio o final
     text = (message.text or message.caption or "").strip()
     
-    # Interceptar comandos ANTES que nada
-    if text.lower().startswith("/season"):
-        return await handle_season_command(message)
-    if text.lower().startswith("/link"):
-        return await handle_manual_link(message)
+    # Cancelar procesos pendientes
+    if text.lower().startswith("/cancelar"):
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM message_map WHERE used=FALSE")
+        return await message.reply("✅ Procesos pendientes cancelados. Se ha limpiado la memoria temporal.")
 
-    if message.video or message.document:
-        return await handle_content(message)
-        
+    if text.lower().startswith("/season"): return await handle_season_command(message)
+    if text.lower().startswith("/link"): return await handle_manual_link(message)
+
+    if message.video or message.document: return await handle_content(message)
     if message.text or message.photo:
-        if not _is_first_in_group(message.media_group_id):
-            return
+        if not _is_first_in_group(message.media_group_id): return
         return await handle_description(message)
 
 async def handle_description(message: types.Message):
@@ -306,19 +266,15 @@ async def handle_description(message: types.Message):
 
 async def handle_content(message: types.Message):
     target = None
-    if message.reply_to_message:
-        target = await get_target_by_msg_id(message.reply_to_message.message_id)
-    if not target:
-        target = await get_recent_pending()
+    if message.reply_to_message: target = await get_target_by_msg_id(message.reply_to_message.message_id)
+    if not target: target = await get_recent_pending()
 
     if not target:
         text = message.caption or ""
-        if text.strip() and len(text) > 50:
-            return await create_standalone_movie(message)
+        if text.strip() and len(text) > 50: return await create_standalone_movie(message)
         return await message.reply("⚠️ No hay descripción pendiente.\nReenvía el texto primero o usa <code>/link codigo</code> respondiendo a este video.")
 
-    if target["target_type"] == "season":
-        await add_episode(message, target["target_code"])
+    if target["target_type"] == "season": await add_episode(message, target["target_code"])
     else:
         await add_movie(message, target["target_code"])
         await mark_used(target["target_code"], "description")
@@ -329,9 +285,7 @@ async def add_movie(message: types.Message, code: str):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE content SET file_id=$1, media_type=$2, content_type='movie', status='ready' WHERE code=$3", file_id, media_type, code)
     
-    pub_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Publicar ahora en Canal Público", callback_data=PublishCB(code=code).pack())]
-    ])
+    pub_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📢 Publicar ahora en Canal Público", callback_data=PublishCB(code=code).pack())]])
     await message.reply(f"✅ Película lista y vinculada.\nCódigo: <code>{code}</code>\n\n¿Deseas publicarlo en tu canal público?", reply_markup=pub_kb)
 
 async def create_standalone_movie(message: types.Message):
@@ -348,27 +302,19 @@ async def create_standalone_movie(message: types.Message):
                VALUES ($1,$2,$3,NULL,$4,'movie',$5,$6,'ready')""",
             code, title, text, tags, file_id, media_type,
         )
-    
-    pub_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Publicar ahora en Canal Público", callback_data=PublishCB(code=code).pack())]
-    ])
+    pub_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📢 Publicar ahora en Canal Público", callback_data=PublishCB(code=code).pack())]])
     await message.reply(f"✅ Post combinado guardado.\nCódigo: <code>{code}</code>", reply_markup=pub_kb)
 
 async def handle_season_command(message: types.Message):
-    if not message.reply_to_message:
-        return await message.reply("⚠️ Debes <b>responder</b> al mensaje del bot que dice 'Descripción guardada' con <code>/season N</code>")
-    
+    if not message.reply_to_message: return await message.reply("⚠️ Debes <b>responder</b> al mensaje del bot que dice 'Descripción guardada' con <code>/season N</code>")
     target = await get_target_by_msg_id(message.reply_to_message.message_id)
-    if not target or target["target_type"] != "description":
-        return await message.reply("⚠️ Debes responder al mensaje de confirmación de la descripción (donde te dio el código peli_XXX).")
+    if not target or target["target_type"] != "description": return await message.reply("⚠️ Debes responder al mensaje de confirmación de la descripción (donde te dio el código peli_XXX).")
 
     text = message.text or message.caption or ""
     match = re.search(r"/season\s*(\d+)", text.lower())
-    if not match:
-        return await message.reply("⚠️ Formato incorrecto. Uso: <code>/season 1</code>")
+    if not match: return await message.reply("⚠️ Formato incorrecto. Uso: <code>/season 1</code>")
 
-    season_number = int(match.group(1))
-    await create_season(message, target["target_code"], season_number)
+    await create_season(message, target["target_code"], int(match.group(1)))
 
 async def create_season(message: types.Message, content_code: str, season_number: int):
     season_code = f"{content_code}_s{season_number}"
@@ -376,20 +322,12 @@ async def create_season(message: types.Message, content_code: str, season_number
         try:
             await conn.execute("INSERT INTO seasons (code, content_code, season_number) VALUES ($1,$2,$3)", season_code, content_code, season_number)
             await conn.execute("UPDATE content SET content_type='series' WHERE code=$1", content_code)
-        except asyncpg.UniqueViolationError:
-            return await message.reply(f"⚠️ Temporada {season_number} ya existe.")
+        except asyncpg.UniqueViolationError: return await message.reply(f"⚠️ Temporada {season_number} ya existe.")
 
-    confirmation = await message.reply(
-        f"✅ Temporada {season_number} creada.\nCódigo: <code>{season_code}</code>\n\n"
-        f"👉 Reenvía los episodios:\n"
-        f"• Como respuesta a <b>ESTE</b> mensaje, o\n"
-        f"• Directamente (se vincularán solos)"
-    )
+    confirmation = await message.reply(f"✅ Temporada {season_number} creada.\nCódigo: <code>{season_code}</code>\n\n👉 Reenvía los episodios respondiendo a <b>ESTE</b> mensaje o directamente.")
     await save_confirmation(confirmation.message_id, season_code, "season")
     
-    pub_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Publicar ahora en Canal Público", callback_data=PublishCB(code=content_code).pack())]
-    ])
+    pub_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📢 Publicar ahora en Canal Público", callback_data=PublishCB(code=content_code).pack())]])
     await message.reply("Puedes publicar el post de la serie ahora mismo (luego puedes actualizarlo):", reply_markup=pub_kb)
 
 async def add_episode(message: types.Message, season_code: str):
@@ -406,90 +344,74 @@ async def add_episode(message: types.Message, season_code: str):
 async def handle_manual_link(message: types.Message):
     text = (message.text or message.caption or "").strip()
     parts = text.split(maxsplit=1)
-    
-    if len(parts) < 2: 
-        return await message.reply("Uso: <code>/link codigo</code> (ej: /link peli_746)")
-    
+    if len(parts) < 2: return await message.reply("Uso: <code>/link codigo</code> (ej: /link peli_746)")
     code = parts[1].strip()
 
-    # Detectar si el video está en el mensaje actual o en la respuesta
-    if message.video or message.document:
-        target_msg = message
-    elif message.reply_to_message and (message.reply_to_message.video or message.reply_to_message.document):
-        target_msg = message.reply_to_message
-    else:
-        return await message.reply("⚠️ Debes enviar el video con este texto como descripción, o <b>responder a un video</b> con <code>/link codigo</code>.")
+    if message.video or message.document: target_msg = message
+    elif message.reply_to_message and (message.reply_to_message.video or message.reply_to_message.document): target_msg = message.reply_to_message
+    else: return await message.reply("⚠️ Debes enviar el video con este texto como descripción, o <b>responder a un video</b> con <code>/link codigo</code>.")
 
     async with db_pool.acquire() as conn:
-        season = await conn.fetchrow("SELECT code FROM seasons WHERE code=$1", code)
-        if season: 
-            return await add_episode(target_msg, code)
-            
-        content = await conn.fetchrow("SELECT code FROM content WHERE code=$1", code)
-        if content: 
-            return await add_movie(target_msg, code)
-            
+        if await conn.fetchrow("SELECT code FROM seasons WHERE code=$1", code): return await add_episode(target_msg, code)
+        if await conn.fetchrow("SELECT code FROM content WHERE code=$1", code): return await add_movie(target_msg, code)
     await message.reply(f"❌ Código <code>{code}</code> no encontrado en la base de datos.")
 
 # ================= PUBLICACIÓN Y BORRADO =================
 @dp.callback_query(PublishCB.filter(), IsAdmin())
 async def on_publish(query: types.CallbackQuery, callback_data: PublishCB):
-    if PUBLIC_CHANNEL_ID == 0:
-        return await query.answer("⚠️ Falta configurar PUBLIC_CHANNEL_ID en BotKeep.", show_alert=True)
-    
+    if PUBLIC_CHANNEL_ID == 0: return await query.answer("⚠️ Falta configurar PUBLIC_CHANNEL_ID en BotKeep.", show_alert=True)
     await query.answer("Publicando...")
-    success = await send_formatted_post(PUBLIC_CHANNEL_ID, callback_data.code)
-    
-    if success:
-        await query.message.edit_text(f"✅ <b>¡Publicado!</b>\nEl post ya está en tu canal público.")
-    else:
-        await query.message.edit_text("❌ Error al publicar. Asegúrate de que el bot es Administrador en el Canal Público.")
+    if await send_formatted_post(PUBLIC_CHANNEL_ID, callback_data.code): await query.message.edit_text(f"✅ <b>¡Publicado!</b>\nEl post ya está en tu canal público.")
+    else: await query.message.edit_text("❌ Error al publicar. Asegúrate de que el bot es Administrador en el Canal Público.")
 
 @dp.message(Command("publicar"), IsAdmin())
 async def cmd_publicar(message: types.Message, command: CommandObject):
     if not command.args: return await message.answer("Uso: <code>/publicar codigo</code>")
     if PUBLIC_CHANNEL_ID == 0: return await message.answer("⚠️ Falta configurar PUBLIC_CHANNEL_ID en BotKeep.")
-    
-    code = command.args.strip()
     status = await message.answer("⏳ Publicando en el canal público...")
-    success = await send_formatted_post(PUBLIC_CHANNEL_ID, code)
-    if success:
-        await status.edit_text("✅ Publicado con éxito en el canal público.")
-    else:
-        await status.edit_text("❌ Error al publicar.")
+    if await send_formatted_post(PUBLIC_CHANNEL_ID, command.args.strip()): await status.edit_text("✅ Publicado con éxito.")
+    else: await status.edit_text("❌ Error al publicar.")
 
 @dp.message(Command("borrar"), IsAdmin())
 async def cmd_borrar(message: types.Message, command: CommandObject):
-    if not command.args:
-        return await message.answer("🗑 Uso: <code>/borrar codigo</code>\nEjemplo: <code>/borrar peli_123</code>")
-    
+    if not command.args: return await message.answer("🗑 Uso: <code>/borrar codigo</code>")
     code = command.args.strip()
     async with db_pool.acquire() as conn:
         content = await conn.fetchrow("SELECT code, public_message_id FROM content WHERE code=$1", code)
-    
-    if not content:
-        return await message.answer("❌ Código no encontrado en la base de datos.")
+    if not content: return await message.answer("❌ Código no encontrado.")
     
     status_msg = await message.answer(f"🗑 Eliminando <code>{code}</code>...")
-    
     if content["public_message_id"] and PUBLIC_CHANNEL_ID != 0:
-        try:
-            await bot.delete_message(chat_id=PUBLIC_CHANNEL_ID, message_id=content["public_message_id"])
-            logging.info(f"Post {code} eliminado del canal público.")
-        except Exception as e:
-            logging.warning(f"No se pudo borrar el post {code} del canal público: {e}")
+        try: await bot.delete_message(chat_id=PUBLIC_CHANNEL_ID, message_id=content["public_message_id"])
+        except Exception as e: logging.warning(f"No se pudo borrar el post {code} del canal público: {e}")
     
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM content WHERE code=$1", code)
-    
+    async with db_pool.acquire() as conn: await conn.execute("DELETE FROM content WHERE code=$1", code)
     await status_msg.edit_text(f"✅ <b>Contenido eliminado.</b>\nCódigo: <code>{code}</code>\n\n(Se han borrado también sus temporadas, episodios y el post del canal público si estaba publicado).")
 
-# ================= ENTREGA AL USUARIO =================
+@dp.message(Command("borrar_episodio"), IsAdmin())
+async def cmd_borrar_episodio(message: types.Message, command: CommandObject):
+    if not command.args: return await message.answer("🗑 Uso: <code>/borrar_episodio code_sX numero</code>\nEjemplo: <code>/borrar_episodio peli_123_s1 2</code>")
+    
+    try:
+        season_code, ep_num_str = command.args.strip().rsplit(" ", 1)
+        ep_num = int(ep_num_str)
+    except ValueError:
+        return await message.answer("❌ Formato incorrecto. Usa: <code>/borrar_episodio code_sX numero</code>")
+
+    async with db_pool.acquire() as conn:
+        exists = await conn.fetchrow("SELECT id FROM episodes WHERE season_code=$1 AND episode_number=$2", season_code, ep_num)
+        if not exists: return await message.answer(f"❌ No se encontró el episodio {ep_num} en <code>{season_code}</code>.")
+        
+        async with conn.transaction():
+            await conn.execute("DELETE FROM episodes WHERE season_code=$1 AND episode_number=$2", season_code, ep_num)
+            await conn.execute("UPDATE episodes SET episode_number = episode_number - 1 WHERE season_code=$1 AND episode_number > $2", season_code, ep_num)
+            
+    await message.answer(f"✅ <b>Episodio {ep_num} eliminado de <code>{season_code}</code>.</b>\nLos episodios siguientes se han reordenado automáticamente.")
+
+# ================= ENTREGA AL USUARIO (CON AUTO-BORRADO) =================
 async def deliver_description(chat_id: int, content):
-    if content["description_photo_id"]:
-        await bot.send_photo(chat_id, photo=content["description_photo_id"], caption=content["description_text"] or None)
-    elif content["description_text"]:
-        await bot.send_message(chat_id, text=content["description_text"])
+    if content["description_photo_id"]: await bot.send_photo(chat_id, photo=content["description_photo_id"], caption=content["description_text"] or None)
+    elif content["description_text"]: await bot.send_message(chat_id, text=content["description_text"])
 
 async def deliver_by_code(chat_id: int, code: str):
     async with db_pool.acquire() as conn:
@@ -506,11 +428,16 @@ async def deliver_by_code(chat_id: int, code: str):
         fav_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⭐ Guardar en favoritos", callback_data=FavToggleCB(code=code).pack())]])
         await deliver_description(chat_id, content)
 
+        # AVISO DE AUTO-BORRADO
+        aviso = await bot.send_message(chat_id, "⚠️ <b>Aviso:</b> El archivo se eliminará de este chat automáticamente en 10 minutos por seguridad. Descárgalo o guárdalo antes.")
+        asyncio.create_task(delete_later(chat_id, aviso.message_id, 600))
+
         if content["content_type"] == "movie":
-            if content["media_type"] == "video":
-                await bot.send_video(chat_id, video=content["file_id"], reply_markup=fav_kb)
-            else:
-                await bot.send_document(chat_id, document=content["file_id"], reply_markup=fav_kb)
+            if content["media_type"] == "video": msg = await bot.send_video(chat_id, video=content["file_id"], reply_markup=fav_kb)
+            else: msg = await bot.send_document(chat_id, document=content["file_id"], reply_markup=fav_kb)
+            
+            # AUTO-BORRADO DEL VIDEO
+            asyncio.create_task(delete_later(chat_id, msg.message_id, 600))
         else:
             await bot.send_message(chat_id, "📺 Temporadas disponibles:", reply_markup=fav_kb)
             seasons = await conn.fetch("SELECT code, season_number FROM seasons WHERE content_code=$1 ORDER BY season_number", code)
@@ -522,49 +449,44 @@ async def deliver_episodes(chat_id: int, season_code: str):
     async with db_pool.acquire() as conn:
         eps = await conn.fetch("SELECT episode_number, file_id, media_type, title FROM episodes WHERE season_code=$1 ORDER BY episode_number", season_code)
     if not eps: return await bot.send_message(chat_id, "⚠️ Esta temporada no tiene episodios.")
+    
     await bot.send_message(chat_id, f"📺 Enviando {len(eps)} episodio(s)...")
+    aviso = await bot.send_message(chat_id, "⚠️ <b>Aviso:</b> Los archivos se eliminarán de este chat automáticamente en 10 minutos por seguridad. Descárgalos o guárdalos antes.")
+    asyncio.create_task(delete_later(chat_id, aviso.message_id, 600))
+
     for ep in eps:
         try:
             cap = f"<b>{ep['title']}</b>"
-            if ep["media_type"] == "video":
-                await bot.send_video(chat_id, video=ep["file_id"], caption=cap)
-            else:
-                await bot.send_document(chat_id, document=ep["file_id"], caption=cap)
+            if ep["media_type"] == "video": msg = await bot.send_video(chat_id, video=ep["file_id"], caption=cap)
+            else: msg = await bot.send_document(chat_id, document=ep["file_id"], caption=cap)
+            
+            # AUTO-BORRADO POR EPISODIO
+            asyncio.create_task(delete_later(chat_id, msg.message_id, 600))
             await asyncio.sleep(0.15)
-        except Exception as e:
-            logging.error(f"Error ep {ep['episode_number']}: {e}")
+        except Exception as e: logging.error(f"Error ep {ep['episode_number']}: {e}")
 
 # ================= START / BÚSQUEDA =================
 @dp.message(CommandStart(deep_link=True))
 async def start_deep(message: types.Message, command: CommandObject):
     await register_user(message.from_user)
-    if not await check_sub(message.from_user.id):
-        return await send_join_message(message, command.args)
-    if command.args: 
-        await deliver_by_code(message.chat.id, command.args)
+    if not await check_sub(message.from_user.id): return await send_join_message(message, command.args)
+    if command.args: await deliver_by_code(message.chat.id, command.args)
 
 @dp.message(CommandStart())
 async def start(message: types.Message):
     await register_user(message.from_user)
-    if not await check_sub(message.from_user.id):
-        return await send_join_message(message)
+    if not await check_sub(message.from_user.id): return await send_join_message(message)
     
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT value FROM settings WHERE key='welcome_message'")
-    
-    if row and row["value"]:
-        await message.answer(row["value"])
-    else:
-        await message.answer("👋 ¡Hola!\n\n🎬 Pulsa los botones del canal.\n🔍 Escribe el título o usa /buscar.\n⭐ /favoritos\n\n<i>(El administrador puede cambiar este mensaje desde el panel /admin)</i>")
+    async with db_pool.acquire() as conn: row = await conn.fetchrow("SELECT value FROM settings WHERE key='welcome_message'")
+    if row and row["value"]: await message.answer(row["value"])
+    else: await message.answer("👋 ¡Hola!\n\n🎬 Pulsa los botones del canal.\n🔍 Escribe el título o usa /buscar.\n⭐ /favoritos\n\n<i>(El administrador puede cambiar este mensaje desde el panel /admin)</i>")
 
 async def build_search(query: str):
     async with db_pool.acquire() as conn:
         return await conn.fetch("SELECT code, title FROM content WHERE status='ready' AND (title ILIKE $1 OR tags ILIKE $1) LIMIT 20", f"%{query}%")
 
 async def send_results(message: types.Message, query: str):
-    if not await check_sub(message.from_user.id):
-        return await send_join_message(message)
-        
+    if not await check_sub(message.from_user.id): return await send_join_message(message)
     rows = await build_search(query)
     if not rows: return await message.answer(f"🔍 Sin resultados para «{query}».")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"🎬 {r['title'][:50]}", callback_data=SearchCB(code=r["code"]).pack())] for r in rows])
@@ -574,22 +496,19 @@ async def send_results(message: types.Message, query: str):
 async def buscar(message: types.Message, command: CommandObject):
     await register_user(message.from_user)
     if not command.args: 
-        if not await check_sub(message.from_user.id):
-            return await send_join_message(message)
+        if not await check_sub(message.from_user.id): return await send_join_message(message)
         return await message.answer("🔍 Uso: <code>/buscar nombre</code>")
     await send_results(message, command.args)
 
 @dp.callback_query(SearchCB.filter())
 async def on_search(query: types.CallbackQuery, callback_data: SearchCB):
-    if not await check_sub(query.from_user.id):
-        return await send_join_message(query, callback_data.code)
+    if not await check_sub(query.from_user.id): return await send_join_message(query, callback_data.code)
     await query.answer()
     await deliver_by_code(query.from_user.id, callback_data.code)
 
 @dp.callback_query(SeasonCB.filter())
 async def on_season(query: types.CallbackQuery, callback_data: SeasonCB):
-    if not await check_sub(query.from_user.id):
-        return await send_join_message(query, callback_data.code)
+    if not await check_sub(query.from_user.id): return await send_join_message(query, callback_data.code)
     await query.answer()
     await deliver_by_code(query.from_user.id, callback_data.code)
 
@@ -601,18 +520,13 @@ async def inline_search(query: types.InlineQuery):
     results = []
     for r in rows:
         link = await create_start_link(bot, payload=r["code"], encode=False)
-        results.append(InlineQueryResultArticle(
-            id=r["code"], title=r["title"], description="Pulsa para ver",
-            input_message_content=InputTextMessageContent(message_text=f"🎬 <b>{r['title']}</b>\n\n👉 <a href='{link}'>Ver contenido</a>")
-        ))
+        results.append(InlineQueryResultArticle(id=r["code"], title=r["title"], description="Pulsa para ver", input_message_content=InputTextMessageContent(message_text=f"🎬 <b>{r['title']}</b>\n\n👉 <a href='{link}'>Ver contenido</a>")))
     await query.answer(results, cache_time=10)
 
 # ================= FAVORITOS =================
 @dp.callback_query(FavToggleCB.filter())
 async def toggle_fav(query: types.CallbackQuery, callback_data: FavToggleCB):
-    if not await check_sub(query.from_user.id):
-        return await send_join_message(query, callback_data.code)
-        
+    if not await check_sub(query.from_user.id): return await send_join_message(query, callback_data.code)
     uid, code = query.from_user.id, callback_data.code
     async with db_pool.acquire() as conn:
         exists = await conn.fetchrow("SELECT 1 FROM favorites WHERE user_id=$1 AND code=$2", uid, code)
@@ -626,9 +540,7 @@ async def toggle_fav(query: types.CallbackQuery, callback_data: FavToggleCB):
 
 @dp.message(Command("favoritos"))
 async def favs(message: types.Message):
-    if not await check_sub(message.from_user.id):
-        return await send_join_message(message)
-        
+    if not await check_sub(message.from_user.id): return await send_join_message(message)
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT m.code, m.title FROM favorites f JOIN content m ON m.code=f.code WHERE f.user_id=$1 AND m.status='ready'", message.from_user.id)
     if not rows: return await message.answer("⭐ Sin favoritos.")
@@ -639,78 +551,41 @@ async def favs(message: types.Message):
 ADMIN_SECTIONS = {
     "guia": (
         "📝 <b>CÓMO PUBLICAR CONTENIDO</b>\n\n"
-        "<b>🎬 Película en 1 post (recomendado)</b>\n"
-        "Reenvía al canal privado un post que ya tenga <b>video + descripción</b>.\n\n"
-        "<b>🎬 Película en 2 pasos</b>\n"
-        "1. Reenvía la descripción (texto o foto) → el bot te dará un código.\n"
-        "2. Reenvía el video respondiendo al mensaje del bot.\n\n"
-        "<b>📺 Serie con temporadas</b>\n"
-        "1. Reenvía la descripción → obtienes <code>peli_XXX</code>.\n"
-        "2. Responde al mensaje del bot con <code>/season 1</code>.\n"
-        "3. Reenvía los episodios respondiendo a ese mensaje.\n"
-        "4. Repite con <code>/season 2</code>, etc.\n\n"
-        "⚠️ Al terminar, el bot te dará un botón para <b>Publicar directamente en tu Canal Público</b>."
+        "<b>🎬 Película en 1 post</b>\nReenvía al canal privado un post que ya tenga <b>video + descripción</b>.\n\n"
+        "<b>🎬 Película en 2 pasos</b>\n1. Reenvía la descripción (texto o foto) → obtienes código.\n2. Reenvía el video respondiendo al mensaje del bot.\n\n"
+        "<b>📺 Serie con temporadas</b>\n1. Reenvía la descripción → obtienes <code>peli_XXX</code>.\n2. Responde al bot con <code>/season 1</code>.\n3. Reenvía los episodios respondiendo a ese mensaje.\n4. Repite con <code>/season 2</code>, etc.\n\n"
+        "⚠️ Si te equivocas, envía <code>/cancelar</code> en el canal privado para detener el proceso."
     ),
     "pelis": (
         "🎬 <b>COMANDOS DE PELÍCULAS</b>\n\n"
-        "<b>/link codigo</b>\n"
-        "Responde a un video con este comando para vincularlo manualmente a una película ya creada.\n"
-        "<i>Ejemplo:</i> responde al video con <code>/link peli_123</code>\n\n"
-        "🔗 <b>Enlace generado:</b>\n"
-        "<code>https://t.me/TuBot?start=peli_123</code>\n\n"
-        "Al pulsarlo, el usuario recibe primero la descripción y luego el video.\n\n"
-        "📢 <b>Publicar:</b>\n"
-        "Al vincular el video, el bot te dará un botón para publicarlo directamente en tu canal público."
+        "<b>/link codigo</b>\nResponde a un video con este comando para vincularlo manualmente a una película ya creada.\n<i>Ejemplo:</i> responde al video con <code>/link peli_123</code>\n\n"
+        "📢 <b>Publicar:</b> Al vincular el video, el bot te dará un botón para publicarlo directamente en tu canal público."
     ),
     "series": (
         "📺 <b>COMANDOS DE SERIES</b>\n\n"
-        "<b>/season N</b>\n"
-        "Respondiendo al mensaje de confirmación de una descripción, crea una temporada.\n"
-        "<i>Ejemplo:</i> <code>/season 1</code>, <code>/season 2</code>...\n\n"
-        "🔗 <b>Enlace generado por temporada:</b>\n"
-        "<code>https://t.me/TuBot?start=peli_XXX_s1</code>\n\n"
-        "Al pulsar el de una temporada, el bot envía <b>todos los episodios de esa temporada, en orden, uno tras otro</b>. No mezcla temporadas.\n\n"
-        "📢 <b>Publicar:</b>\n"
-        "Puedes publicar en el canal público en cuanto crees la Temporada 1, o usar <code>/publicar peli_XXX</code> más tarde para actualizar el post con las nuevas temporadas."
-    ),
-    "enlaces": (
-        "🔗 <b>ENLACES Y BOTONES</b>\n\n"
-        "El bot genera los enlaces automáticamente. Al pulsar el botón de publicar, el post aparecerá en tu canal con los botones ya configurados (Ver Película, o Temporada 1, 2, etc.).\n\n"
-        "💡 Si necesitas el enlace de forma manual (para ponerlo en otro sitio), usa <code>/post codigo</code> para que el bot te lo muestre."
-    ),
-    "post": (
-        "📢 <b>ENVIAR POST / RESTAURAR CANAL</b>\n\n"
-        "<b>/publicar codigo</b>\n"
-        "Si editas una serie o quieres volver a subir el post (por ejemplo, al añadir la T2), usa este comando. Se publicará un nuevo mensaje en el canal público.\n\n"
-        "<b>/restaurar ID_CANAL</b>\n"
-        "Si tu canal principal es baneado, usa esto para enviar TODOS los posts de golpe a tu nuevo canal.\n"
-        "<i>Ejemplo:</i> <code>/restaurar -1001234567890</code>"
+        "<b>/season N</b>\nRespondiendo al mensaje de confirmación de una descripción, crea una temporada.\n<i>Ejemplo:</i> <code>/season 1</code>, <code>/season 2</code>...\n\n"
+        "📢 <b>Publicar:</b> Puedes publicar en el canal público en cuanto crees la Temporada 1, o usar <code>/publicar peli_XXX</code> más tarde para actualizar el post con las nuevas temporadas."
     ),
     "borrar": (
         "🗑 <b>ELIMINAR CONTENIDO</b>\n\n"
-        "<b>/borrar codigo</b>\n"
-        "Elimina un contenido de la base de datos y, si estaba publicado en el canal público, <b>también elimina el post del canal</b>.\n\n"
-        "Si es una serie, borrará también sus temporadas y todos sus episodios automáticamente.\n\n"
-        "<i>Ejemplo:</i> <code>/borrar peli_123</code>\n\n"
-        "⚠️ <b>Esta acción no se puede deshacer.</b> Usa <code>/lista</code> para ver los códigos antes de borrar."
+        "<b>/borrar codigo</b>\nElimina una película o serie de la base de datos y <b>también borra el post del canal público</b> si estaba publicado.\n<i>Ejemplo:</i> <code>/borrar peli_123</code>\n\n"
+        "<b>/borrar_episodio code_sX num</b>\nElimina un episodio específico de una temporada y <b>reordena automáticamente</b> los siguientes.\n<i>Ejemplo:</i> <code>/borrar_episodio peli_123_s1 2</code>"
     ),
     "bienvenida": (
-        "👋 <b>MENSAJE DE BIENVENIDA</b>\n\n"
-        "Aquí puedes configurar el mensaje que verán los usuarios cuando escriban <code>/start</code> en el bot.\n\n"
-        "Puedes usar formato HTML (ej: <code>&lt;b&gt;texto&lt;/b&gt;</code> para negrita, <code>&lt;i&gt;texto&lt;/i&gt;</code> para cursiva) e incluir enlaces.\n\n"
-        "Pulsa en el botón de abajo para escribir el nuevo mensaje."
+        "👋 <b>MENSAJE DE BIENVENIDA</b>\n\nConfigura el mensaje que verán los usuarios en <code>/start</code>. Puedes usar HTML y enlaces.\n\nPulsa en el botón para editarlo."
     ),
     "sticker": (
-        "🎭 <b>STICKER DE PUBLICACIÓN</b>\n\n"
-        "Aquí puedes configurar un sticker que el bot enviará automáticamente al canal público <b>justo después de publicar un post</b>.\n\n"
-        "Pulsa en el botón de abajo y luego envíame el sticker que quieras usar. El bot lo guardará y lo usará siempre."
+        "🎭 <b>STICKER DE PUBLICACIÓN</b>\n\nConfigura un sticker que el bot enviará automáticamente al canal público <b>justo después de publicar un post</b>.\n\nPulsa en el botón para enviar uno nuevo."
+    ),
+    "post": (
+        "📢 <b>ENVIAR POST / RESTAURAR CANAL</b>\n\n"
+        "<b>/publicar codigo</b>\nVuelve a publicar el post en el canal público (útil si añadiste una nueva temporada).\n\n"
+        "<b>/restaurar ID_CANAL</b>\nSi tu canal principal es baneado, usa esto para enviar TODOS los posts de golpe a tu nuevo canal.\n<i>Ejemplo:</i> <code>/restaurar -1001234567890</code>"
     ),
     "msgs": (
         "📣 <b>NOTIFICACIONES Y AVISOS</b>\n\n"
-        "<b>/notify codigo</b>\n"
-        "Avisa a todos los usuarios del bot sobre un nuevo estreno.\n"
-        "<b>/broadcast</b>\n"
-        "Responde a cualquier mensaje con este comando para enviarlo a todos los usuarios."
+        "<b>/notify codigo</b>\nAvisa a todos los usuarios del bot sobre un nuevo estreno.\n"
+        "<b>/broadcast</b>\nResponde a cualquier mensaje con este comando para enviarlo a todos los usuarios."
     ),
     "stats": (
         "📊 <b>ESTADÍSTICAS</b>\n\n"
@@ -728,23 +603,11 @@ ADMIN_SECTIONS = {
 def admin_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Cómo publicar", callback_data=AdminCB(section="guia").pack())],
-        [
-            InlineKeyboardButton(text="🎬 Películas", callback_data=AdminCB(section="pelis").pack()),
-            InlineKeyboardButton(text="📺 Series",   callback_data=AdminCB(section="series").pack()),
-        ],
-        [
-            InlineKeyboardButton(text="🔗 Enlaces",  callback_data=AdminCB(section="enlaces").pack()),
-            InlineKeyboardButton(text="📢 Post/Restaurar", callback_data=AdminCB(section="post").pack()),
-        ],
-        [
-            InlineKeyboardButton(text="🗑 Borrar Contenido", callback_data=AdminCB(section="borrar").pack()),
-            InlineKeyboardButton(text="👋 Bienvenida", callback_data=AdminCB(section="bienvenida").pack()),
-        ],
+        [InlineKeyboardButton(text="🎬 Películas", callback_data=AdminCB(section="pelis").pack()), InlineKeyboardButton(text="📺 Series", callback_data=AdminCB(section="series").pack())],
+        [InlineKeyboardButton(text="🔗 Enlaces", callback_data=AdminCB(section="enlaces").pack()), InlineKeyboardButton(text="📢 Post/Restaurar", callback_data=AdminCB(section="post").pack())],
+        [InlineKeyboardButton(text="🗑 Borrar Contenido", callback_data=AdminCB(section="borrar").pack()), InlineKeyboardButton(text="👋 Bienvenida", callback_data=AdminCB(section="bienvenida").pack())],
         [InlineKeyboardButton(text="🎭 Sticker Post", callback_data=AdminCB(section="sticker").pack())],
-        [
-            InlineKeyboardButton(text="📣 Mensajes", callback_data=AdminCB(section="msgs").pack()),
-            InlineKeyboardButton(text="📊 Stats",    callback_data=AdminCB(section="stats").pack()),
-        ],
+        [InlineKeyboardButton(text="📣 Mensajes", callback_data=AdminCB(section="msgs").pack()), InlineKeyboardButton(text="📊 Stats", callback_data=AdminCB(section="stats").pack())],
         [InlineKeyboardButton(text="⚙️ Otros", callback_data=AdminCB(section="otros").pack())],
         [InlineKeyboardButton(text="❌ Cerrar panel", callback_data=AdminCB(section="close").pack())],
     ])
@@ -753,16 +616,10 @@ def back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Volver al panel", callback_data=AdminCB(section="menu").pack())],[InlineKeyboardButton(text="❌ Cerrar", callback_data=AdminCB(section="close").pack())]])
 
 def welcome_edit_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Escribir nuevo mensaje", callback_data=AdminCB(section="edit_welcome").pack())],
-        [InlineKeyboardButton(text="◀️ Volver al panel", callback_data=AdminCB(section="menu").pack())]
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✏️ Escribir nuevo mensaje", callback_data=AdminCB(section="edit_welcome").pack())],[InlineKeyboardButton(text="◀️ Volver al panel", callback_data=AdminCB(section="menu").pack())]])
 
 def sticker_edit_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎭 Enviar nuevo sticker", callback_data=AdminCB(section="edit_sticker").pack())],
-        [InlineKeyboardButton(text="◀️ Volver al panel", callback_data=AdminCB(section="menu").pack())]
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎭 Enviar nuevo sticker", callback_data=AdminCB(section="edit_sticker").pack())],[InlineKeyboardButton(text="◀️ Volver al panel", callback_data=AdminCB(section="menu").pack())]])
 
 @dp.message(Command("admin"), IsAdmin())
 async def admin_panel(message: types.Message):
@@ -771,13 +628,11 @@ async def admin_panel(message: types.Message):
 @dp.callback_query(AdminCB.filter(), IsAdmin())
 async def admin_callback(query: types.CallbackQuery, callback_data: AdminCB, state: FSMContext):
     section = callback_data.section
-    
     if section == "close":
         await query.answer()
         try: await query.message.delete()
         except: pass
         return
-        
     if section == "menu":
         await query.answer()
         return await query.message.edit_text("🛠 <b>PANEL DE ADMINISTRADOR</b>\n\nToca una categoría para ver los comandos y su explicación:", reply_markup=admin_panel_kb())
@@ -785,49 +640,29 @@ async def admin_callback(query: types.CallbackQuery, callback_data: AdminCB, sta
     if section == "edit_welcome":
         await query.answer()
         await state.set_state(AdminStates.waiting_for_welcome)
-        return await query.message.edit_text(
-            "✏️ <b>Envía el nuevo mensaje de bienvenida</b>\n\n"
-            "Puedes usar formato HTML y emojis. Envíalo en el siguiente mensaje.\n\n"
-            "Para cancelar, envía /cancelar",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data=AdminCB(section="menu").pack())]])
-        )
+        return await query.message.edit_text("✏️ <b>Envía el nuevo mensaje de bienvenida</b>\n\nPuedes usar HTML y emojis. Envíalo en el siguiente mensaje.\n\nPara cancelar, envía /cancelar", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data=AdminCB(section="menu").pack())]]))
 
     if section == "edit_sticker":
         await query.answer()
         await state.set_state(AdminStates.waiting_for_sticker)
-        return await query.message.edit_text(
-            "🎭 <b>Envía el sticker que quieres usar</b>\n\n"
-            "Por favor, envíame el sticker en el siguiente mensaje.\n\n"
-            "Para cancelar, envía /cancelar",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data=AdminCB(section="menu").pack())]])
-        )
+        return await query.message.edit_text("🎭 <b>Envía el sticker que quieres usar</b>\n\nPor favor, envíame el sticker en el siguiente mensaje.\n\nPara cancelar, envía /cancelar", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data=AdminCB(section="menu").pack())]]))
 
     text = ADMIN_SECTIONS.get(section)
     if not text: return await query.answer("Sección no encontrada.", show_alert=True)
-    
     await query.answer()
-    
-    if section == "bienvenida":
-        await query.message.edit_text(text, reply_markup=welcome_edit_kb())
-    elif section == "sticker":
-        await query.message.edit_text(text, reply_markup=sticker_edit_kb())
-    else:
-        await query.message.edit_text(text, reply_markup=back_kb())
+    if section == "bienvenida": await query.message.edit_text(text, reply_markup=welcome_edit_kb())
+    elif section == "sticker": await query.message.edit_text(text, reply_markup=sticker_edit_kb())
+    else: await query.message.edit_text(text, reply_markup=back_kb())
 
+# ================= RECIBIR NUEVA BIENVENIDA O STICKER =================
 @dp.message(AdminStates.waiting_for_welcome, IsAdmin())
 async def process_new_welcome(message: types.Message, state: FSMContext):
     if message.text == "/cancelar":
         await state.clear()
         return await message.answer("❌ Edición cancelada.", reply_markup=admin_panel_kb())
-
     new_text = message.html_text 
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('welcome_message', $1) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            new_text
-        )
-    
+        await conn.execute("INSERT INTO settings (key, value) VALUES ('welcome_message', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", new_text)
     await state.clear()
     await message.answer("✅ <b>Mensaje de bienvenida actualizado.</b>\n\nAsí lo verán los usuarios:", reply_markup=admin_panel_kb())
     await message.answer(new_text)
@@ -837,22 +672,12 @@ async def process_new_sticker(message: types.Message, state: FSMContext):
     if message.text == "/cancelar":
         await state.clear()
         return await message.answer("❌ Edición cancelada.", reply_markup=admin_panel_kb())
-
-    if not message.sticker:
-        return await message.answer("⚠️ Eso no es un sticker. Por favor, envía un sticker de Telegram o escribe /cancelar.")
-
-    sticker_id = message.sticker.file_id
-    
+    if not message.sticker: return await message.answer("⚠️ Eso no es un sticker. Por favor, envía un sticker o escribe /cancelar.")
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('post_sticker', $1) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            sticker_id
-        )
-    
+        await conn.execute("INSERT INTO settings (key, value) VALUES ('post_sticker', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", message.sticker.file_id)
     await state.clear()
-    await message.answer("✅ <b>Sticker guardado correctamente.</b>\n\nEl bot enviará este sticker después de cada publicación en el canal. Aquí tienes una vista previa:", reply_markup=admin_panel_kb())
-    await message.answer_sticker(sticker_id)
+    await message.answer("✅ <b>Sticker guardado correctamente.</b>\n\nEl bot enviará este sticker después de cada publicación. Vista previa:", reply_markup=admin_panel_kb())
+    await message.answer_sticker(message.sticker.file_id)
 
 @dp.message(F.text & ~F.text.startswith("/") & (F.chat.type == ChatType.PRIVATE))
 async def text_search(message: types.Message):
@@ -869,17 +694,14 @@ async def cmd_restaurar(message: types.Message, command: CommandObject):
     status_msg = await message.answer("⏳ Iniciando la restauración de todo el catálogo...")
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT code FROM content WHERE status='ready' ORDER BY created_at")
-    
     if not rows: return await status_msg.edit_text("❌ No hay contenido listo para restaurar.")
 
     enviados = fallidos = 0
     for row in rows:
-        success = await send_formatted_post(new_channel_id, row["code"])
-        if success:
+        if await send_formatted_post(new_channel_id, row["code"]):
             enviados += 1
             await asyncio.sleep(0.5)
         else: fallidos += 1
-
     await status_msg.edit_text(f"✅ Restauración completada.\n\nPublicados: {enviados}\nFallidos: {fallidos}")
 
 @dp.message(Command("notify"), IsAdmin())
