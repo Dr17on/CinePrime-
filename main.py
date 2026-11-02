@@ -63,7 +63,6 @@ def _is_first_in_group(group_id: str | None) -> bool:
 
 # ================= AUTO-BORRADO =================
 async def delete_later(chat_id: int, message_id: int, delay: int = 600):
-    """Espera X segundos y borra el mensaje en el PV del usuario"""
     await asyncio.sleep(delay)
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -223,7 +222,6 @@ async def send_formatted_post(chat_id: int, code: str):
 async def handle_storage(message: types.Message):
     text = (message.text or message.caption or "").strip()
     
-    # Cancelar procesos pendientes
     if text.lower().startswith("/cancelar"):
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM message_map WHERE used=FALSE")
@@ -391,7 +389,6 @@ async def cmd_borrar(message: types.Message, command: CommandObject):
 @dp.message(Command("borrar_episodio"), IsAdmin())
 async def cmd_borrar_episodio(message: types.Message, command: CommandObject):
     if not command.args: return await message.answer("🗑 Uso: <code>/borrar_episodio code_sX numero</code>\nEjemplo: <code>/borrar_episodio peli_123_s1 2</code>")
-    
     try:
         season_code, ep_num_str = command.args.strip().rsplit(" ", 1)
         ep_num = int(ep_num_str)
@@ -401,14 +398,12 @@ async def cmd_borrar_episodio(message: types.Message, command: CommandObject):
     async with db_pool.acquire() as conn:
         exists = await conn.fetchrow("SELECT id FROM episodes WHERE season_code=$1 AND episode_number=$2", season_code, ep_num)
         if not exists: return await message.answer(f"❌ No se encontró el episodio {ep_num} en <code>{season_code}</code>.")
-        
         async with conn.transaction():
             await conn.execute("DELETE FROM episodes WHERE season_code=$1 AND episode_number=$2", season_code, ep_num)
             await conn.execute("UPDATE episodes SET episode_number = episode_number - 1 WHERE season_code=$1 AND episode_number > $2", season_code, ep_num)
-            
     await message.answer(f"✅ <b>Episodio {ep_num} eliminado de <code>{season_code}</code>.</b>\nLos episodios siguientes se han reordenado automáticamente.")
 
-# ================= ENTREGA AL USUARIO (CON AUTO-BORRADO) =================
+# ================= ENTREGA AL USUARIO =================
 async def deliver_description(chat_id: int, content):
     if content["description_photo_id"]: await bot.send_photo(chat_id, photo=content["description_photo_id"], caption=content["description_text"] or None)
     elif content["description_text"]: await bot.send_message(chat_id, text=content["description_text"])
@@ -428,15 +423,12 @@ async def deliver_by_code(chat_id: int, code: str):
         fav_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⭐ Guardar en favoritos", callback_data=FavToggleCB(code=code).pack())]])
         await deliver_description(chat_id, content)
 
-        # AVISO DE AUTO-BORRADO
         aviso = await bot.send_message(chat_id, "⚠️ <b>Aviso:</b> El archivo se eliminará de este chat automáticamente en 10 minutos por seguridad. Descárgalo o guárdalo antes.")
         asyncio.create_task(delete_later(chat_id, aviso.message_id, 600))
 
         if content["content_type"] == "movie":
             if content["media_type"] == "video": msg = await bot.send_video(chat_id, video=content["file_id"], reply_markup=fav_kb)
             else: msg = await bot.send_document(chat_id, document=content["file_id"], reply_markup=fav_kb)
-            
-            # AUTO-BORRADO DEL VIDEO
             asyncio.create_task(delete_later(chat_id, msg.message_id, 600))
         else:
             await bot.send_message(chat_id, "📺 Temporadas disponibles:", reply_markup=fav_kb)
@@ -459,8 +451,6 @@ async def deliver_episodes(chat_id: int, season_code: str):
             cap = f"<b>{ep['title']}</b>"
             if ep["media_type"] == "video": msg = await bot.send_video(chat_id, video=ep["file_id"], caption=cap)
             else: msg = await bot.send_document(chat_id, document=ep["file_id"], caption=cap)
-            
-            # AUTO-BORRADO POR EPISODIO
             asyncio.create_task(delete_later(chat_id, msg.message_id, 600))
             await asyncio.sleep(0.15)
         except Exception as e: logging.error(f"Error ep {ep['episode_number']}: {e}")
@@ -565,6 +555,11 @@ ADMIN_SECTIONS = {
         "📺 <b>COMANDOS DE SERIES</b>\n\n"
         "<b>/season N</b>\nRespondiendo al mensaje de confirmación de una descripción, crea una temporada.\n<i>Ejemplo:</i> <code>/season 1</code>, <code>/season 2</code>...\n\n"
         "📢 <b>Publicar:</b> Puedes publicar en el canal público en cuanto crees la Temporada 1, o usar <code>/publicar peli_XXX</code> más tarde para actualizar el post con las nuevas temporadas."
+    ),
+    "enlaces": (
+        "🔗 <b>ENLACES Y BOTONES</b>\n\n"
+        "El bot genera los enlaces automáticamente. Al pulsar el botón de publicar, el post aparecerá en tu canal con los botones ya configurados (Ver Película, o Temporada 1, 2, etc.).\n\n"
+        "💡 Si necesitas el enlace de forma manual (para ponerlo en otro sitio), usa <code>/post codigo</code> para que el bot te lo muestre."
     ),
     "borrar": (
         "🗑 <b>ELIMINAR CONTENIDO</b>\n\n"
