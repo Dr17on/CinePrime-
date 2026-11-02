@@ -14,6 +14,7 @@ from aiogram.filters import CommandStart, Command, CommandObject, BaseFilter
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     InlineQueryResultArticle, InputTextMessageContent,
@@ -33,12 +34,13 @@ if not BOT_TOKEN or not DATABASE_URL:
     raise SystemExit("❌ Faltan BOT_TOKEN o DATABASE_URL en las variables de entorno.")
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 db_pool: asyncpg.Pool = None
 
 # ================= ESTADOS (FSM) =================
 class AdminStates(StatesGroup):
     waiting_for_welcome = State()
+    waiting_for_sticker = State()
 
 # ================= FILTROS =================
 class IsAdmin(BaseFilter):
@@ -240,6 +242,16 @@ async def send_formatted_post(chat_id: int, code: str):
         if chat_id == PUBLIC_CHANNEL_ID and msg:
             async with db_pool.acquire() as conn:
                 await conn.execute("UPDATE content SET public_message_id=$1 WHERE code=$2", msg.message_id, code)
+                
+            async with db_pool.acquire() as conn:
+                sticker_row = await conn.fetchrow("SELECT value FROM settings WHERE key='post_sticker'")
+            
+            if sticker_row and sticker_row["value"]:
+                try:
+                    await bot.send_sticker(chat_id, sticker=sticker_row["value"])
+                except Exception as e:
+                    logging.warning(f"No se pudo enviar el sticker: {e}")
+            
         return True
     except Exception as e:
         logging.error(f"Error enviando post {code} al chat {chat_id}: {e}")
@@ -248,8 +260,10 @@ async def send_formatted_post(chat_id: int, code: str):
 # ================= CANAL PRIVADO =================
 @dp.channel_post(F.chat.id == STORAGE_CHANNEL_ID)
 async def handle_storage(message: types.Message):
-    text = message.text or message.caption or ""
+    # .strip() elimina espacios en blanco invisibles al principio o final
+    text = (message.text or message.caption or "").strip()
     
+    # Interceptar comandos ANTES que nada
     if text.lower().startswith("/season"):
         return await handle_season_command(message)
     if text.lower().startswith("/link"):
@@ -301,7 +315,7 @@ async def handle_content(message: types.Message):
         text = message.caption or ""
         if text.strip() and len(text) > 50:
             return await create_standalone_movie(message)
-        return await message.reply("⚠️ No hay descripción pendiente.\nReenvía el texto primero o usa <code>/link codigo</code>.")
+        return await message.reply("⚠️ No hay descripción pendiente.\nReenvía el texto primero o usa <code>/link codigo</code> respondiendo a este video.")
 
     if target["target_type"] == "season":
         await add_episode(message, target["target_code"])
@@ -318,7 +332,7 @@ async def add_movie(message: types.Message, code: str):
     pub_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Publicar ahora en Canal Público", callback_data=PublishCB(code=code).pack())]
     ])
-    await message.reply(f"✅ Película lista.\nCódigo: <code>{code}</code>\n\n¿Deseas publicarlo en tu canal público?", reply_markup=pub_kb)
+    await message.reply(f"✅ Película lista y vinculada.\nCódigo: <code>{code}</code>\n\n¿Deseas publicarlo en tu canal público?", reply_markup=pub_kb)
 
 async def create_standalone_movie(message: types.Message):
     code = f"peli_{message.message_id}"
@@ -390,17 +404,32 @@ async def add_episode(message: types.Message, season_code: str):
     await message.reply(f"✅ Episodio {num} añadido a <code>{season_code}</code>.")
 
 async def handle_manual_link(message: types.Message):
-    text = message.text or message.caption or ""
+    text = (message.text or message.caption or "").strip()
     parts = text.split(maxsplit=1)
-    if len(parts) < 2: return await message.reply("Uso: <code>/link codigo</code> (como respuesta a un video)")
+    
+    if len(parts) < 2: 
+        return await message.reply("Uso: <code>/link codigo</code> (ej: /link peli_746)")
+    
     code = parts[1].strip()
+
+    # Detectar si el video está en el mensaje actual o en la respuesta
+    if message.video or message.document:
+        target_msg = message
+    elif message.reply_to_message and (message.reply_to_message.video or message.reply_to_message.document):
+        target_msg = message.reply_to_message
+    else:
+        return await message.reply("⚠️ Debes enviar el video con este texto como descripción, o <b>responder a un video</b> con <code>/link codigo</code>.")
 
     async with db_pool.acquire() as conn:
         season = await conn.fetchrow("SELECT code FROM seasons WHERE code=$1", code)
-        if season: return await add_episode(message, code)
+        if season: 
+            return await add_episode(target_msg, code)
+            
         content = await conn.fetchrow("SELECT code FROM content WHERE code=$1", code)
-        if content: return await add_movie(message, code)
-    await message.reply(f"❌ Código <code>{code}</code> no encontrado.")
+        if content: 
+            return await add_movie(target_msg, code)
+            
+    await message.reply(f"❌ Código <code>{code}</code> no encontrado en la base de datos.")
 
 # ================= PUBLICACIÓN Y BORRADO =================
 @dp.callback_query(PublishCB.filter(), IsAdmin())
@@ -520,14 +549,12 @@ async def start(message: types.Message):
     if not await check_sub(message.from_user.id):
         return await send_join_message(message)
     
-    # Obtener mensaje de bienvenida personalizado
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT value FROM settings WHERE key='welcome_message'")
     
     if row and row["value"]:
         await message.answer(row["value"])
     else:
-        # Mensaje por defecto si no has configurado ninguno
         await message.answer("👋 ¡Hola!\n\n🎬 Pulsa los botones del canal.\n🔍 Escribe el título o usa /buscar.\n⭐ /favoritos\n\n<i>(El administrador puede cambiar este mensaje desde el panel /admin)</i>")
 
 async def build_search(query: str):
@@ -551,16 +578,6 @@ async def buscar(message: types.Message, command: CommandObject):
             return await send_join_message(message)
         return await message.answer("🔍 Uso: <code>/buscar nombre</code>")
     await send_results(message, command.args)
-
-@dp.message(F.text & ~F.text.startswith("/") & (F.chat.type == ChatType.PRIVATE))
-async def text_search(message: types.Message, state: FSMContext):
-    # Evitar que el buscador interfiera si el admin está escribiendo la bienvenida
-    current_state = await state.get_state()
-    if current_state == AdminStates.waiting_for_welcome.state:
-        return 
-
-    await register_user(message.from_user)
-    await send_results(message, message.text)
 
 @dp.callback_query(SearchCB.filter())
 async def on_search(query: types.CallbackQuery, callback_data: SearchCB):
@@ -683,6 +700,11 @@ ADMIN_SECTIONS = {
         "Puedes usar formato HTML (ej: <code>&lt;b&gt;texto&lt;/b&gt;</code> para negrita, <code>&lt;i&gt;texto&lt;/i&gt;</code> para cursiva) e incluir enlaces.\n\n"
         "Pulsa en el botón de abajo para escribir el nuevo mensaje."
     ),
+    "sticker": (
+        "🎭 <b>STICKER DE PUBLICACIÓN</b>\n\n"
+        "Aquí puedes configurar un sticker que el bot enviará automáticamente al canal público <b>justo después de publicar un post</b>.\n\n"
+        "Pulsa en el botón de abajo y luego envíame el sticker que quieras usar. El bot lo guardará y lo usará siempre."
+    ),
     "msgs": (
         "📣 <b>NOTIFICACIONES Y AVISOS</b>\n\n"
         "<b>/notify codigo</b>\n"
@@ -718,6 +740,7 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗑 Borrar Contenido", callback_data=AdminCB(section="borrar").pack()),
             InlineKeyboardButton(text="👋 Bienvenida", callback_data=AdminCB(section="bienvenida").pack()),
         ],
+        [InlineKeyboardButton(text="🎭 Sticker Post", callback_data=AdminCB(section="sticker").pack())],
         [
             InlineKeyboardButton(text="📣 Mensajes", callback_data=AdminCB(section="msgs").pack()),
             InlineKeyboardButton(text="📊 Stats",    callback_data=AdminCB(section="stats").pack()),
@@ -729,10 +752,15 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
 def back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Volver al panel", callback_data=AdminCB(section="menu").pack())],[InlineKeyboardButton(text="❌ Cerrar", callback_data=AdminCB(section="close").pack())]])
 
-# --- BOTÓN EDITAR BIENVENIDA ---
 def welcome_edit_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Escribir nuevo mensaje", callback_data=AdminCB(section="edit_welcome").pack())],
+        [InlineKeyboardButton(text="◀️ Volver al panel", callback_data=AdminCB(section="menu").pack())]
+    ])
+
+def sticker_edit_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎭 Enviar nuevo sticker", callback_data=AdminCB(section="edit_sticker").pack())],
         [InlineKeyboardButton(text="◀️ Volver al panel", callback_data=AdminCB(section="menu").pack())]
     ])
 
@@ -764,26 +792,35 @@ async def admin_callback(query: types.CallbackQuery, callback_data: AdminCB, sta
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data=AdminCB(section="menu").pack())]])
         )
 
+    if section == "edit_sticker":
+        await query.answer()
+        await state.set_state(AdminStates.waiting_for_sticker)
+        return await query.message.edit_text(
+            "🎭 <b>Envía el sticker que quieres usar</b>\n\n"
+            "Por favor, envíame el sticker en el siguiente mensaje.\n\n"
+            "Para cancelar, envía /cancelar",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data=AdminCB(section="menu").pack())]])
+        )
+
     text = ADMIN_SECTIONS.get(section)
     if not text: return await query.answer("Sección no encontrada.", show_alert=True)
     
     await query.answer()
     
-    # Si entra en la sección de bienvenida, mostramos el botón de editar
     if section == "bienvenida":
         await query.message.edit_text(text, reply_markup=welcome_edit_kb())
+    elif section == "sticker":
+        await query.message.edit_text(text, reply_markup=sticker_edit_kb())
     else:
         await query.message.edit_text(text, reply_markup=back_kb())
 
-# ================= RECIBIR NUEVA BIENVENIDA =================
 @dp.message(AdminStates.waiting_for_welcome, IsAdmin())
 async def process_new_welcome(message: types.Message, state: FSMContext):
     if message.text == "/cancelar":
         await state.clear()
         return await message.answer("❌ Edición cancelada.", reply_markup=admin_panel_kb())
 
-    new_text = message.html_text # Usa html_text para conservar negritas y enlaces
-    
+    new_text = message.html_text 
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO settings (key, value) VALUES ('welcome_message', $1) "
@@ -794,6 +831,33 @@ async def process_new_welcome(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ <b>Mensaje de bienvenida actualizado.</b>\n\nAsí lo verán los usuarios:", reply_markup=admin_panel_kb())
     await message.answer(new_text)
+
+@dp.message(AdminStates.waiting_for_sticker, IsAdmin())
+async def process_new_sticker(message: types.Message, state: FSMContext):
+    if message.text == "/cancelar":
+        await state.clear()
+        return await message.answer("❌ Edición cancelada.", reply_markup=admin_panel_kb())
+
+    if not message.sticker:
+        return await message.answer("⚠️ Eso no es un sticker. Por favor, envía un sticker de Telegram o escribe /cancelar.")
+
+    sticker_id = message.sticker.file_id
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('post_sticker', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            sticker_id
+        )
+    
+    await state.clear()
+    await message.answer("✅ <b>Sticker guardado correctamente.</b>\n\nEl bot enviará este sticker después de cada publicación en el canal. Aquí tienes una vista previa:", reply_markup=admin_panel_kb())
+    await message.answer_sticker(sticker_id)
+
+@dp.message(F.text & ~F.text.startswith("/") & (F.chat.type == ChatType.PRIVATE))
+async def text_search(message: types.Message):
+    await register_user(message.from_user)
+    await send_results(message, message.text)
 
 # ================= RESTAURACIÓN Y OTROS COMANDOS ADMIN =================
 @dp.message(Command("restaurar"), IsAdmin())
