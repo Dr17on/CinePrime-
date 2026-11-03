@@ -44,6 +44,7 @@ db_pool: asyncpg.Pool = None
 class AdminStates(StatesGroup):
     waiting_for_welcome = State()
     waiting_for_sticker = State()
+    waiting_for_tmdb = State()
 
 # ================= FILTROS =================
 class IsAdmin(BaseFilter):
@@ -65,24 +66,26 @@ def _is_first_in_group(group_id: str | None) -> bool:
 async def delete_later(chat_id: int, message_id: int, delay: int = 600):
     await asyncio.sleep(delay)
     try: await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception as e: logging.warning(f"No se pudo borrar msg {message_id}: {e}")
+    except Exception: pass
 
-# ================= TMDB INTEGRACIÓN =================
+# ================= TMDB =================
 async def fetch_tmdb_data(tipo: str, titulo: str):
-    if not TMDB_API_KEY: return None
-    # tipo: "movie" o "tv"
+    if not TMDB_API_KEY: return "SIN_API_KEY"
     url = f"https://api.themoviedb.org/3/search/{tipo}?api_key={TMDB_API_KEY}&language=es-ES&query={titulo}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status != 200: return None
-            data = await resp.json()
-            if not data.get("results"): return None
-            item = data["results"][0]
-            
-            # Obtener detalles completos
-            detail_url = f"https://api.themoviedb.org/3/{tipo}/{item['id']}?api_key={TMDB_API_KEY}&language=es-ES"
-            async with session.get(detail_url) as detail_resp:
-                return await detail_resp.json()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status != 200: return None
+                data = await resp.json()
+                if not data.get("results"): return None
+                item = data["results"][0]
+                
+                detail_url = f"https://api.themoviedb.org/3/{tipo}/{item['id']}?api_key={TMDB_API_KEY}&language=es-ES"
+                async with session.get(detail_url, timeout=10) as detail_resp:
+                    return await detail_resp.json()
+    except Exception as e:
+        logging.error(f"Error TMDB: {e}")
+        return None
 
 # ================= CALLBACKS =================
 class SearchCB(CallbackData, prefix="srch"): code: str
@@ -100,7 +103,7 @@ async def check_sub(user_id: int) -> bool:
         member = await bot.get_chat_member(chat_id=PUBLIC_CHANNEL_ID, user_id=user_id)
         return member.status in ["member", "administrator", "creator"]
     except Exception as e:
-        logging.error(f"Error verificando suscripción de {user_id}: {e}")
+        logging.error(f"Error verificando suscripción: {e}")
         return False
 
 async def send_join_message(event, payload: str = ""):
@@ -168,6 +171,12 @@ async def init_db():
             ALTER TABLE content ADD COLUMN IF NOT EXISTS tmdb_id INT;
             ALTER TABLE message_map ADD COLUMN IF NOT EXISTS used BOOLEAN DEFAULT FALSE;
             ALTER TABLE message_map ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+
+            -- 🚨 REPARACIÓN AUTOMÁTICA DE ESTADOS 🚨
+            -- Arregla las películas que tienen video pero estaban marcadas como pendientes/inválidas
+            UPDATE content SET status = 'ready' WHERE file_id IS NOT NULL AND status != 'ready';
+            -- Arregla las series que tienen temporadas pero estaban marcadas como pendientes/inválidas
+            UPDATE content SET status = 'ready' WHERE content_type = 'series' AND code IN (SELECT content_code FROM seasons) AND status != 'ready';
         """)
 
 async def register_user(user: types.User):
@@ -228,21 +237,17 @@ async def send_formatted_post(chat_id: int, code: str):
                 sticker_row = await conn.fetchrow("SELECT value FROM settings WHERE key='post_sticker'")
             if sticker_row and sticker_row["value"]:
                 try: await bot.send_sticker(chat_id, sticker=sticker_row["value"])
-                except Exception as e: logging.warning(f"No se pudo enviar el sticker: {e}")
+                except Exception as e: logging.warning(f"Error sticker: {e}")
         return True
     except Exception as e:
-        logging.error(f"Error enviando post {code} al chat {chat_id}: {e}")
+        logging.error(f"Error enviando post {code}: {e}")
         return False
 
-# ================= COMANDO TMDB =================
-@dp.message(Command("tmdb"), IsAdmin())
-async def cmd_tmdb(message: types.Message, command: CommandObject):
-    if not command.args:
-        return await message.answer("🎬 Uso: <code>/tmdb peli Inception</code> o <code>/tmdb serie Breaking Bad</code>\n(También puedes usar 'anime')")
-    
-    parts = command.args.strip().split(maxsplit=1)
+# ================= LÓGICA TMDB =================
+async def process_tmdb_query(message: types.Message, query_text: str):
+    parts = query_text.strip().split(maxsplit=1)
     if len(parts) < 2:
-        return await message.answer("⚠️ Debes indicar el tipo (peli/serie/anime) y el título.")
+        return await message.answer("⚠️ Debes indicar el tipo (peli/serie/anime) y el título.\nEjemplo: <code>peli Inception</code>")
     
     tipo_raw, titulo = parts[0].lower(), parts[1]
     tipo_tmdb = "movie" if tipo_raw in ["peli", "pelicula", "película", "movie"] else "tv"
@@ -250,8 +255,11 @@ async def cmd_tmdb(message: types.Message, command: CommandObject):
     status_msg = await message.answer("⏳ Buscando en TMDB...")
     
     data = await fetch_tmdb_data(tipo_tmdb, titulo)
+    
+    if data == "SIN_API_KEY":
+        return await status_msg.edit_text("❌ Falta configurar `TMDB_API_KEY` en las variables de entorno de BotKeep.")
     if not data:
-        return await status_msg.edit_text("❌ No se encontró el contenido en TMDB. Verifica el nombre o tu API Key.")
+        return await status_msg.edit_text("❌ No se encontró el contenido en TMDB o hubo un error de conexión. Intenta de nuevo.")
         
     nombre = data.get("title") or data.get("name")
     sinopsis = data.get("overview") or "Sin sinopsis disponible."
@@ -272,7 +280,6 @@ async def cmd_tmdb(message: types.Message, command: CommandObject):
     else:
         encabezado = "🧃Película:"
 
-    # Construir texto exacto solicitado
     texto = (
         f"{encabezado} {nombre}\n"
         f"🍀Géneros: {generos}\n"
@@ -283,24 +290,35 @@ async def cmd_tmdb(message: types.Message, command: CommandObject):
         f"▬ι𓆃__ ▬ι𓆃__ ▬ι𓆃 ____ ▬ι𓆃"
     )
 
-    # Botón para publicar
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="📤 Enviar al Canal de Almacenamiento", callback_data=TmdbSaveCB(tipo=tipo_tmdb, tmdb_id=tmdb_id, payload=texto).pack())
     ]])
 
     await status_msg.delete()
     
-    # Enviar Póster + Texto
     if poster_path:
         photo_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
         try:
             await message.answer_photo(photo=photo_url, caption=texto, reply_markup=kb)
             return
         except Exception as e:
-            logging.error(f"Error enviando poster: {e}")
+            logging.error(f"Error poster: {e}")
             
-    # Si falla el poster o no hay, envía solo el texto
     await message.answer(texto, reply_markup=kb)
+
+@dp.message(Command("tmdb"), IsAdmin())
+async def cmd_tmdb(message: types.Message, command: CommandObject):
+    if not command.args:
+        return await message.answer("🎬 Uso: <code>/tmdb peli Inception</code> o <code>/tmdb serie Breaking Bad</code>")
+    await process_tmdb_query(message, command.args)
+
+@dp.message(AdminStates.waiting_for_tmdb, IsAdmin())
+async def process_tmdb_state(message: types.Message, state: FSMContext):
+    if message.text == "/cancelar":
+        await state.clear()
+        return await message.answer("❌ Búsqueda cancelada.", reply_markup=admin_panel_kb())
+    await state.clear()
+    await process_tmdb_query(message, message.text)
 
 @dp.callback_query(TmdbSaveCB.filter(), IsAdmin())
 async def on_tmdb_save(query: types.CallbackQuery, callback_data: TmdbSaveCB):
@@ -308,10 +326,8 @@ async def on_tmdb_save(query: types.CallbackQuery, callback_data: TmdbSaveCB):
     
     try:
         if query.message.photo:
-            # Copiamos el mensaje con la foto al canal de almacenamiento
             msg = await query.message.copy_to(chat_id=STORAGE_CHANNEL_ID)
         else:
-            # Copiamos el mensaje de texto
             msg = await bot.send_message(chat_id=STORAGE_CHANNEL_ID, text=query.message.text)
     except Exception as e:
         return await query.message.edit_text(f"❌ Error al enviar al canal: {e}")
@@ -328,14 +344,12 @@ async def on_tmdb_save(query: types.CallbackQuery, callback_data: TmdbSaveCB):
                ON CONFLICT (code) DO UPDATE SET description_text=EXCLUDED.description_text""",
             code, title, texto_completo, photo_id, callback_data.tmdb_id, callback_data.tipo
         )
-        # Mapear la respuesta del bot en el canal
         reply = await bot.send_message(
             chat_id=STORAGE_CHANNEL_ID,
             text=f"⬆️ <b>Responde a este mensaje con el video.</b>\nCódigo: <code>{code}</code>"
         )
         await conn.execute("INSERT INTO message_map (bot_message_id, target_code, target_type) VALUES ($1,$2,'description')", reply.message_id, code)
 
-    # Actualizar el mensaje original en el chat del admin
     try:
         if query.message.photo:
             await query.message.edit_caption(caption=texto_completo + "\n\n✅ <b>Enviado al canal. Responde allí con el video.</b>", reply_markup=None)
@@ -351,7 +365,7 @@ async def handle_storage(message: types.Message):
     if text.lower().startswith("/cancelar"):
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM message_map WHERE used=FALSE")
-        return await message.reply("✅ Procesos pendientes cancelados. Se ha limpiado la memoria temporal.")
+        return await message.reply("✅ Procesos pendientes cancelados.")
 
     if text.lower().startswith("/season"): return await handle_season_command(message)
     if text.lower().startswith("/link"): return await handle_manual_link(message)
@@ -430,7 +444,7 @@ async def create_standalone_movie(message: types.Message):
     await message.reply(f"✅ Post combinado guardado.\nCódigo: <code>{code}</code>", reply_markup=pub_kb)
 
 async def handle_season_command(message: types.Message):
-    if not message.reply_to_message: return await message.reply("⚠️ Debes <b>responder</b> al mensaje del bot que dice 'Descripción guardada' con <code>/season N</code>")
+    if not message.reply_to_message: return await message.reply("⚠️ Debes <b>responder</b> al mensaje del bot con <code>/season N</code>")
     target = await get_target_by_msg_id(message.reply_to_message.message_id)
     if not target or target["target_type"] != "description": return await message.reply("⚠️ Debes responder al mensaje de confirmación de la descripción (donde te dio el código peli_XXX).")
 
@@ -452,7 +466,7 @@ async def create_season(message: types.Message, content_code: str, season_number
     await save_confirmation(confirmation.message_id, season_code, "season")
     
     pub_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📢 Publicar ahora en Canal Público", callback_data=PublishCB(code=content_code).pack())]])
-    await message.reply("Puedes publicar el post de la serie ahora mismo (luego puedes actualizarlo):", reply_markup=pub_kb)
+    await message.reply("Puedes publicar el post de la serie ahora mismo:", reply_markup=pub_kb)
 
 async def add_episode(message: types.Message, season_code: str):
     file_id = message.video.file_id if message.video else message.document.file_id
@@ -473,37 +487,32 @@ async def handle_manual_link(message: types.Message):
 
     if message.video or message.document: target_msg = message
     elif message.reply_to_message and (message.reply_to_message.video or message.reply_to_message.document): target_msg = message.reply_to_message
-    else: return await message.reply("⚠️ Debes enviar el video con este texto como descripción, o <b>responder a un video</b> con <code>/link codigo</code>.")
+    else: return await message.reply("⚠️ Debes enviar el video con este texto, o <b>responder a un video</b> con <code>/link codigo</code>.")
 
     async with db_pool.acquire() as conn:
         if await conn.fetchrow("SELECT code FROM seasons WHERE code=$1", code): return await add_episode(target_msg, code)
         if await conn.fetchrow("SELECT code FROM content WHERE code=$1", code): return await add_movie(target_msg, code)
-    await message.reply(f"❌ Código <code>{code}</code> no encontrado en la base de datos.")
+    await message.reply(f"❌ Código <code>{code}</code> no encontrado.")
 
 # ================= PUBLICACIÓN Y BORRADO =================
 @dp.callback_query(PublishCB.filter(), IsAdmin())
 async def on_publish(query: types.CallbackQuery, callback_data: PublishCB):
-    if PUBLIC_CHANNEL_ID == 0: return await query.answer("⚠️ Falta configurar PUBLIC_CHANNEL_ID en BotKeep.", show_alert=True)
+    if PUBLIC_CHANNEL_ID == 0: return await query.answer("⚠️ Falta PUBLIC_CHANNEL_ID.", show_alert=True)
     await query.answer("Publicando...")
     
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE content SET status='ready' WHERE code=$1", callback_data.code)
         
-    if await send_formatted_post(PUBLIC_CHANNEL_ID, callback_data.code): await query.message.edit_text(f"✅ <b>¡Publicado!</b>\nEl post ya está en tu canal público.")
-    else: await query.message.edit_text("❌ Error al publicar. Asegúrate de que el bot es Administrador en el Canal Público.")
+    if await send_formatted_post(PUBLIC_CHANNEL_ID, callback_data.code): await query.message.edit_text(f"✅ <b>¡Publicado!</b>")
+    else: await query.message.edit_text("❌ Error al publicar. Revisa permisos del bot.")
 
 @dp.message(Command("publicar"), IsAdmin())
 async def cmd_publicar(message: types.Message, command: CommandObject):
     if not command.args: return await message.answer("Uso: <code>/publicar codigo</code>")
-    if PUBLIC_CHANNEL_ID == 0: return await message.answer("⚠️ Falta configurar PUBLIC_CHANNEL_ID en BotKeep.")
-    
-    code = command.args.strip()
-    status = await message.answer("⏳ Publicando en el canal público...")
-    
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE content SET status='ready' WHERE code=$1", code)
-        
-    if await send_formatted_post(PUBLIC_CHANNEL_ID, code): await status.edit_text("✅ Publicado con éxito y estado actualizado a Listo ✅.")
+    if PUBLIC_CHANNEL_ID == 0: return await message.answer("⚠️ Falta PUBLIC_CHANNEL_ID.")
+    status = await message.answer("⏳ Publicando...")
+    async with db_pool.acquire() as conn: await conn.execute("UPDATE content SET status='ready' WHERE code=$1", command.args.strip())
+    if await send_formatted_post(PUBLIC_CHANNEL_ID, command.args.strip()): await status.edit_text("✅ Publicado con éxito.")
     else: await status.edit_text("❌ Error al publicar.")
 
 @dp.message(Command("borrar"), IsAdmin())
@@ -517,39 +526,38 @@ async def cmd_borrar(message: types.Message, command: CommandObject):
     status_msg = await message.answer(f"🗑 Eliminando <code>{code}</code>...")
     if content["public_message_id"] and PUBLIC_CHANNEL_ID != 0:
         try: await bot.delete_message(chat_id=PUBLIC_CHANNEL_ID, message_id=content["public_message_id"])
-        except Exception as e: logging.warning(f"No se pudo borrar el post {code} del canal público: {e}")
+        except Exception as e: logging.warning(f"Error borrar post: {e}")
     
     async with db_pool.acquire() as conn: await conn.execute("DELETE FROM content WHERE code=$1", code)
     await status_msg.edit_text(f"✅ <b>Contenido eliminado.</b>\nCódigo: <code>{code}</code>")
 
 @dp.message(Command("borrar_temporada"), IsAdmin())
 async def cmd_borrar_temporada(message: types.Message, command: CommandObject):
-    if not command.args: return await message.answer("🗑 Uso: <code>/borrar_temporada code_sX</code>\nEjemplo: <code>/borrar_temporada peli_123_s1</code>")
+    if not command.args: return await message.answer("🗑 Uso: <code>/borrar_temporada code_sX</code>")
     season_code = command.args.strip()
     
     async with db_pool.acquire() as conn:
         season = await conn.fetchrow("SELECT content_code FROM seasons WHERE code=$1", season_code)
-        if not season: return await message.answer(f"❌ No se encontró la temporada <code>{season_code}</code>.")
+        if not season: return await message.answer(f"❌ No se encontró <code>{season_code}</code>.")
         
         content_code = season["content_code"]
-        status_msg = await message.answer(f"🗑 Eliminando temporada <code>{season_code}</code> y todos sus episodios...")
+        status_msg = await message.answer(f"🗑 Eliminando temporada <code>{season_code}</code>...")
         
         await conn.execute("DELETE FROM seasons WHERE code=$1", season_code)
         
         remaining = await conn.fetchval("SELECT COUNT(*) FROM seasons WHERE content_code=$1", content_code)
-        if remaining == 0:
-            await conn.execute("UPDATE content SET content_type='movie' WHERE code=$1", content_code)
+        if remaining == 0: await conn.execute("UPDATE content SET content_type='movie' WHERE code=$1", content_code)
             
-    await status_msg.edit_text(f"✅ <b>Temporada eliminada.</b>\nCódigo: <code>{season_code}</code>\n\n(Todos sus episodios fueron borrados).\n" + ("La serie se ha quedado sin temporadas, puedes borrarla con <code>/borrar " + content_code + "</code>." if remaining == 0 else ""))
+    await status_msg.edit_text(f"✅ <b>Temporada eliminada.</b>\nCódigo: <code>{season_code}</code>")
 
 @dp.message(Command("borrar_episodio"), IsAdmin())
 async def cmd_borrar_episodio(message: types.Message, command: CommandObject):
-    if not command.args: return await message.answer("🗑 Uso: <code>/borrar_episodio code_sX numero</code>\nEjemplo: <code>/borrar_episodio peli_123_s1 2</code>")
+    if not command.args: return await message.answer("🗑 Uso: <code>/borrar_episodio code_sX numero</code>")
     try:
         season_code, ep_num_str = command.args.strip().rsplit(" ", 1)
         ep_num = int(ep_num_str)
     except ValueError:
-        return await message.answer("❌ Formato incorrecto. Usa: <code>/borrar_episodio code_sX numero</code>")
+        return await message.answer("❌ Formato incorrecto.")
 
     async with db_pool.acquire() as conn:
         exists = await conn.fetchrow("SELECT id FROM episodes WHERE season_code=$1 AND episode_number=$2", season_code, ep_num)
@@ -557,7 +565,7 @@ async def cmd_borrar_episodio(message: types.Message, command: CommandObject):
         async with conn.transaction():
             await conn.execute("DELETE FROM episodes WHERE season_code=$1 AND episode_number=$2", season_code, ep_num)
             await conn.execute("UPDATE episodes SET episode_number = episode_number - 1 WHERE season_code=$1 AND episode_number > $2", season_code, ep_num)
-    await message.answer(f"✅ <b>Episodio {ep_num} eliminado de <code>{season_code}</code>.</b>\nLos episodios siguientes se han reordenado automáticamente.")
+    await message.answer(f"✅ <b>Episodio {ep_num} eliminado de <code>{season_code}</code>.</b>\nEpisodios reordenados.")
 
 # ================= ENTREGA AL USUARIO =================
 async def deliver_description(chat_id: int, content):
@@ -574,12 +582,15 @@ async def deliver_by_code(chat_id: int, code: str):
 
         content = await conn.fetchrow("SELECT * FROM content WHERE code=$1", code)
         if not content: return await bot.send_message(chat_id, "❌ Contenido no encontrado.")
-        if content["status"] != "ready": return await bot.send_message(chat_id, "⚠️ Este contenido aún no está disponible.")
+        
+        # Verificación de seguridad inteligente: si tiene file_id o es serie, intentamos enviar
+        if content["content_type"] == "movie" and not content["file_id"]:
+            return await bot.send_message(chat_id, "⚠️ Este contenido aún no está disponible.")
 
         fav_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⭐ Guardar en favoritos", callback_data=FavToggleCB(code=code).pack())]])
         await deliver_description(chat_id, content)
 
-        aviso = await bot.send_message(chat_id, "⚠️ <b>Aviso:</b> El archivo se eliminará de este chat automáticamente en 10 minutos por seguridad. Descárgalo o guárdalo antes.")
+        aviso = await bot.send_message(chat_id, "⚠️ <b>Aviso:</b> El archivo se eliminará de este chat en 10 minutos por seguridad. Descárgalo antes.")
         asyncio.create_task(delete_later(chat_id, aviso.message_id, 600))
 
         if content["content_type"] == "movie":
@@ -599,7 +610,7 @@ async def deliver_episodes(chat_id: int, season_code: str):
     if not eps: return await bot.send_message(chat_id, "⚠️ Esta temporada no tiene episodios.")
     
     await bot.send_message(chat_id, f"📺 Enviando {len(eps)} episodio(s)...")
-    aviso = await bot.send_message(chat_id, "⚠️ <b>Aviso:</b> Los archivos se eliminarán de este chat automáticamente en 10 minutos por seguridad. Descárgalos o guárdalos antes.")
+    aviso = await bot.send_message(chat_id, "⚠️ <b>Aviso:</b> Los archivos se eliminarán de este chat en 10 minutos por seguridad. Descárgalos antes.")
     asyncio.create_task(delete_later(chat_id, aviso.message_id, 600))
 
     for ep in eps:
@@ -625,7 +636,7 @@ async def start(message: types.Message):
     
     async with db_pool.acquire() as conn: row = await conn.fetchrow("SELECT value FROM settings WHERE key='welcome_message'")
     if row and row["value"]: await message.answer(row["value"])
-    else: await message.answer("👋 ¡Hola!\n\n🎬 Pulsa los botones del canal.\n🔍 Escribe el título o usa /buscar.\n⭐ /favoritos\n\n<i>(El administrador puede cambiar este mensaje desde el panel /admin)</i>")
+    else: await message.answer("👋 ¡Hola!\n\n🎬 Pulsa los botones del canal.\n🔍 Escribe el título o usa /buscar.\n⭐ /favoritos")
 
 async def build_search(query: str):
     async with db_pool.acquire() as conn:
@@ -697,52 +708,59 @@ async def favs(message: types.Message):
 ADMIN_SECTIONS = {
     "guia": (
         "📝 <b>CÓMO PUBLICAR CONTENIDO</b>\n\n"
-        "<b>🪄 CON TMDB (Automático)</b>\nUsa <code>/tmdb peli Inception</code> o <code>/tmdb serie Breaking Bad</code>. El bot buscará el póster y la sinopsis, armará el post y te dará un botón para enviarlo al canal de almacenamiento.\n\n"
-        "<b>🎬 Película en 2 pasos (Manual)</b>\n1. Reenvía la descripción (texto o foto) → obtienes código.\n2. Reenvía el video respondiendo al mensaje del bot.\n\n"
-        "<b>📺 Serie con temporadas</b>\n1. Reenvía la descripción → obtienes <code>peli_XXX</code>.\n2. Responde al bot con <code>/season 1</code>.\n3. Reenvía los episodios respondiendo a ese mensaje.\n4. Repite con <code>/season 2</code>, etc.\n\n"
-        "⚠️ Si te equivocas, envía <code>/cancelar</code> en el canal privado para detener el proceso."
+        "<b>🪄 CON TMDB (Automático)</b>\nUsa el botón de abajo o el comando <code>/tmdb</code>. Buscará el póster y la sinopsis, y te dará un botón para enviarlo al almacenamiento.\n\n"
+        "<b>🎬 Película en 2 pasos (Manual)</b>\n1. Reenvía la descripción → obtienes código.\n2. Reenvía el video respondiendo al bot.\n\n"
+        "<b>📺 Serie con temporadas</b>\n1. Reenvía la descripción → obtienes código.\n2. Responde con <code>/season 1</code>.\n3. Reenvía los episodios respondiendo a ese mensaje."
+    ),
+    "tmdb_info": (
+        "🪄 <b>GENERADOR TMDB</b>\n\n"
+        "Esta herramienta busca automáticamente en TMDB el póster, sinopsis, año y géneros de una peli, serie o anime.\n\n"
+        "Al pulsar el botón de abajo, se te pedirá que escribas el tipo y el nombre.\n"
+        "<b>Formatos válidos:</b>\n"
+        "• <code>peli Inception</code>\n"
+        "• <code>serie Breaking Bad</code>\n"
+        "• <code>anime One Piece</code>"
     ),
     "pelis": (
         "🎬 <b>COMANDOS DE PELÍCULAS</b>\n\n"
-        "<b>/link codigo</b>\nResponde a un video con este comando para vincularlo manualmente a una película ya creada.\n<i>Ejemplo:</i> responde al video con <code>/link peli_123</code>\n\n"
-        "📢 <b>Publicar:</b> Al vincular el video, el bot te dará un botón para publicarlo directamente en tu canal público."
+        "<b>/link codigo</b>\nResponde a un video para vincularlo a una película ya creada.\n<i>Ejemplo:</i> responde al video con <code>/link peli_123</code>\n\n"
+        "📢 <b>Publicar:</b> Al vincular el video, el bot te dará un botón para publicarlo en tu canal público."
     ),
     "series": (
         "📺 <b>COMANDOS DE SERIES</b>\n\n"
-        "<b>/season N</b>\nRespondiendo al mensaje de confirmación de una descripción, crea una temporada.\n<i>Ejemplo:</i> <code>/season 1</code>, <code>/season 2</code>...\n\n"
-        "📢 <b>Publicar:</b> Puedes publicar en el canal público en cuanto crees la Temporada 1, o usar <code>/publicar peli_XXX</code> más tarde para actualizar el post con las nuevas temporadas."
+        "<b>/season N</b>\nRespondiendo al mensaje del bot, crea una temporada.\n<i>Ejemplo:</i> <code>/season 1</code>.\n\n"
+        "📢 <b>Publicar:</b> Puedes publicar en el canal público en cuanto crees la Temporada 1, o usar <code>/publicar peli_XXX</code> más tarde."
     ),
     "enlaces": (
         "🔗 <b>ENLACES Y BOTONES</b>\n\n"
-        "El bot genera los enlaces automáticamente. Al pulsar el botón de publicar, el post aparecerá en tu canal con los botones ya configurados (Ver Película, o Temporada 1, 2, etc.).\n\n"
-        "💡 Si necesitas el enlace de forma manual (para ponerlo en otro sitio), usa <code>/post codigo</code> para que el bot te lo muestre."
+        "El bot genera los enlaces automáticamente al publicar. Si necesitas un enlace manual, usa <code>/post codigo</code> para que el bot te lo muestre."
     ),
     "borrar": (
         "🗑 <b>ELIMINAR CONTENIDO</b>\n\n"
-        "<b>/borrar codigo</b>\nElimina una película o serie <b>completa</b> de la base de datos y borra el post del canal público.\n<i>Ejemplo:</i> <code>/borrar peli_123</code>\n\n"
-        "<b>/borrar_temporada code_sX</b>\nElimina una temporada completa y todos sus capítulos de golpe.\n<i>Ejemplo:</i> <code>/borrar_temporada peli_123_s1</code>\n\n"
-        "<b>/borrar_episodio code_sX num</b>\nElimina un episodio específico y <b>reordena</b> los siguientes.\n<i>Ejemplo:</i> <code>/borrar_episodio peli_123_s1 2</code>"
+        "<b>/borrar codigo</b>\nElimina una peli/serie completa y su post del canal público.\n\n"
+        "<b>/borrar_temporada code_sX</b>\nElimina una temporada y sus capítulos.\n\n"
+        "<b>/borrar_episodio code_sX num</b>\nElimina un episodio y reordena el resto."
     ),
     "bienvenida": (
-        "👋 <b>MENSAJE DE BIENVENIDA</b>\n\nConfigura el mensaje que verán los usuarios en <code>/start</code>. Puedes usar HTML y enlaces.\n\nPulsa en el botón para editarlo."
+        "👋 <b>MENSAJE DE BIENVENIDA</b>\n\nConfigura el mensaje de <code>/start</code>. Pulsa en el botón para editarlo."
     ),
     "sticker": (
-        "🎭 <b>STICKER DE PUBLICACIÓN</b>\n\nConfigura un sticker que el bot enviará automáticamente al canal público <b>justo después de publicar un post</b>.\n\nPulsa en el botón para enviar uno nuevo."
+        "🎭 <b>STICKER DE PUBLICACIÓN</b>\n\nConfigura un sticker para enviar tras publicar. Pulsa en el botón para enviar uno nuevo."
     ),
     "post": (
         "📢 <b>ENVIAR POST / RESTAURAR CANAL</b>\n\n"
-        "<b>/publicar codigo</b>\nVuelve a publicar el post en el canal público (útil si añadiste una nueva temporada).\n\n"
-        "<b>/restaurar ID_CANAL</b>\nSi tu canal principal es baneado, usa esto para enviar TODOS los posts de golpe a tu nuevo canal.\n<i>Ejemplo:</i> <code>/restaurar -1001234567890</code>"
+        "<b>/publicar codigo</b>\nVuelve a publicar el post en el canal.\n\n"
+        "<b>/restaurar ID_CANAL</b>\nEnvía TODOS los posts a un nuevo canal si el principal es baneado.\n<i>Ejemplo:</i> <code>/restaurar -1001234567890</code>"
     ),
     "msgs": (
         "📣 <b>NOTIFICACIONES Y AVISOS</b>\n\n"
-        "<b>/notify codigo</b>\nAvisa a todos los usuarios del bot sobre un nuevo estreno.\n"
-        "<b>/broadcast</b>\nResponde a cualquier mensaje con este comando para enviarlo a todos los usuarios."
+        "<b>/notify codigo</b>\nAvisa del estreno a los usuarios.\n"
+        "<b>/broadcast</b>\nResponde a un mensaje con esto para enviarlo a todos."
     ),
     "stats": (
         "📊 <b>ESTADÍSTICAS</b>\n\n"
         "<b>/stats</b>\nMuestra usuarios, pelis, series y episodios.\n"
-        "<b>/lista</b>\nMuestra todo el catálogo con sus códigos y estado."
+        "<b>/lista</b>\nMuestra todo el catálogo."
     ),
     "otros": (
         "⚙️ <b>OTROS COMANDOS</b>\n\n"
@@ -755,6 +773,7 @@ ADMIN_SECTIONS = {
 def admin_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Cómo publicar", callback_data=AdminCB(section="guia").pack())],
+        [InlineKeyboardButton(text="🪄 Usar TMDB", callback_data=AdminCB(section="tmdb_info").pack())],
         [InlineKeyboardButton(text="🎬 Películas", callback_data=AdminCB(section="pelis").pack()), InlineKeyboardButton(text="📺 Series", callback_data=AdminCB(section="series").pack())],
         [InlineKeyboardButton(text="🔗 Enlaces", callback_data=AdminCB(section="enlaces").pack()), InlineKeyboardButton(text="📢 Post/Restaurar", callback_data=AdminCB(section="post").pack())],
         [InlineKeyboardButton(text="🗑 Borrar Contenido", callback_data=AdminCB(section="borrar").pack()), InlineKeyboardButton(text="👋 Bienvenida", callback_data=AdminCB(section="bienvenida").pack())],
@@ -772,6 +791,9 @@ def welcome_edit_kb() -> InlineKeyboardMarkup:
 
 def sticker_edit_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎭 Enviar nuevo sticker", callback_data=AdminCB(section="edit_sticker").pack())],[InlineKeyboardButton(text="◀️ Volver al panel", callback_data=AdminCB(section="menu").pack())]])
+
+def tmdb_edit_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 Buscar en TMDB", callback_data=AdminCB(section="edit_tmdb").pack())],[InlineKeyboardButton(text="◀️ Volver al panel", callback_data=AdminCB(section="menu").pack())]])
 
 @dp.message(Command("admin"), IsAdmin())
 async def admin_panel(message: types.Message):
@@ -792,18 +814,24 @@ async def admin_callback(query: types.CallbackQuery, callback_data: AdminCB, sta
     if section == "edit_welcome":
         await query.answer()
         await state.set_state(AdminStates.waiting_for_welcome)
-        return await query.message.edit_text("✏️ <b>Envía el nuevo mensaje de bienvenida</b>\n\nPuedes usar HTML y emojis. Envíalo en el siguiente mensaje.\n\nPara cancelar, envía /cancelar", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data=AdminCB(section="menu").pack())]]))
+        return await query.message.edit_text("✏️ <b>Envía el nuevo mensaje de bienvenida</b>\n\nEnvíalo en el siguiente mensaje.\n\nPara cancelar, envía /cancelar", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data=AdminCB(section="menu").pack())]]))
 
     if section == "edit_sticker":
         await query.answer()
         await state.set_state(AdminStates.waiting_for_sticker)
-        return await query.message.edit_text("🎭 <b>Envía el sticker que quieres usar</b>\n\nPor favor, envíame el sticker en el siguiente mensaje.\n\nPara cancelar, envía /cancelar", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data=AdminCB(section="menu").pack())]]))
+        return await query.message.edit_text("🎭 <b>Envía el sticker que quieres usar</b>\n\nEnvíalo en el siguiente mensaje.\n\nPara cancelar, envía /cancelar", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data=AdminCB(section="menu").pack())]]))
+
+    if section == "edit_tmdb":
+        await query.answer()
+        await state.set_state(AdminStates.waiting_for_tmdb)
+        return await query.message.edit_text("🪄 <b>¿Qué deseas buscar en TMDB?</b>\n\nEscribe el tipo y el nombre. Ejemplos:\n• <code>peli Inception</code>\n• <code>serie Breaking Bad</code>\n\nPara cancelar, envía /cancelar", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data=AdminCB(section="menu").pack())]]))
 
     text = ADMIN_SECTIONS.get(section)
     if not text: return await query.answer("Sección no encontrada.", show_alert=True)
     await query.answer()
     if section == "bienvenida": await query.message.edit_text(text, reply_markup=welcome_edit_kb())
     elif section == "sticker": await query.message.edit_text(text, reply_markup=sticker_edit_kb())
+    elif section == "tmdb_info": await query.message.edit_text(text, reply_markup=tmdb_edit_kb())
     else: await query.message.edit_text(text, reply_markup=back_kb())
 
 # ================= RECIBIR NUEVA BIENVENIDA O STICKER =================
@@ -828,7 +856,7 @@ async def process_new_sticker(message: types.Message, state: FSMContext):
     async with db_pool.acquire() as conn:
         await conn.execute("INSERT INTO settings (key, value) VALUES ('post_sticker', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", message.sticker.file_id)
     await state.clear()
-    await message.answer("✅ <b>Sticker guardado correctamente.</b>\n\nEl bot enviará este sticker después de cada publicación. Vista previa:", reply_markup=admin_panel_kb())
+    await message.answer("✅ <b>Sticker guardado.</b>\n\nVista previa:", reply_markup=admin_panel_kb())
     await message.answer_sticker(message.sticker.file_id)
 
 @dp.message(F.text & ~F.text.startswith("/") & (F.chat.type == ChatType.PRIVATE))
@@ -843,10 +871,10 @@ async def cmd_restaurar(message: types.Message, command: CommandObject):
     try: new_channel_id = int(command.args.strip())
     except ValueError: return await message.answer("❌ El ID del canal debe ser un número.")
 
-    status_msg = await message.answer("⏳ Iniciando la restauración de todo el catálogo...")
+    status_msg = await message.answer("⏳ Iniciando la restauración...")
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT code FROM content WHERE status='ready' ORDER BY created_at")
-    if not rows: return await status_msg.edit_text("❌ No hay contenido listo para restaurar.")
+    if not rows: return await status_msg.edit_text("❌ No hay contenido para restaurar.")
 
     enviados = fallidos = 0
     for row in rows:
@@ -912,7 +940,7 @@ async def lista(message: types.Message):
         if not rows: return await message.answer("Sin contenido.")
         lines = []
         for r in rows:
-            icon = "✅" if r["status"] == "ready" else "⏳"
+            icon = "✅" if r["status"] == "ready" else "❌"
             kind = "📺" if r["content_type"] == "series" else "🎬"
             lines.append(f"{icon}{kind} <code>{r['code']}</code> — {r['title'][:40]}")
             if r["content_type"] == "series":
@@ -934,7 +962,10 @@ async def log_memory():
 async def validate_file_ids():
     while True:
         await asyncio.sleep(6 * 3600)
-        logging.info("🔍 Validando file_ids... (Modo seguro: no se borrará nada automáticamente)")
+        logging.info("🔍 Validando file_ids...")
+        
+        invalid_items = []
+        
         async with db_pool.acquire() as conn:
             for row in await conn.fetch("SELECT code, file_id FROM content WHERE file_id IS NOT NULL"):
                 try: 
@@ -942,10 +973,9 @@ async def validate_file_ids():
                     await asyncio.sleep(0.3)
                 except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
                 except TelegramBadRequest:
-                    await conn.execute("UPDATE content SET status='invalid' WHERE code=$1", row["code"])
-                    try: await bot.send_message(ADMIN_ID, f"⚠️ El archivo de la película <code>{row['code']}</code> ha caducado o es inválido.")
-                    except: pass
-                except Exception as e: logging.warning(f"Error temporal validando peli {row['code']}: {e}")
+                    # Ya NO cambia el estado a inválido automáticamente para evitar romper las pelis
+                    invalid_items.append(f"🎬 <code>{row['code']}</code>")
+                except Exception: pass
             
             for row in await conn.fetch("SELECT id, season_code, episode_number, file_id FROM episodes"):
                 try: 
@@ -953,9 +983,16 @@ async def validate_file_ids():
                     await asyncio.sleep(0.3)
                 except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
                 except TelegramBadRequest:
-                    try: await bot.send_message(ADMIN_ID, f"⚠️ El archivo del episodio {row['episode_number']} de <code>{row['season_code']}</code> es inválido. Usa /borrar_episodio si quieres eliminarlo.")
-                    except: pass
-                except Exception as e: logging.warning(f"Error temporal validando episodio {row['id']}: {e}")
+                    invalid_items.append(f"🎞 <code>{row['season_code']}</code> - Ep. {row['episode_number']}")
+                except Exception: pass
+
+        if invalid_items:
+            msg = "⚠️ <b>Se detectaron archivos inválidos/caducados:</b>\n\n" + "\n".join(invalid_items[:30])
+            if len(invalid_items) > 30: msg += f"\n... y {len(invalid_items)-30} más."
+            msg += "\n\n<i>Usa /borrar o /borrar_episodio si quieres eliminarlos.</i>"
+            try: await bot.send_message(ADMIN_ID, msg)
+            except: pass
+            
         logging.info("✅ Validación completa.")
 
 # ================= ARRANQUE =================
