@@ -73,7 +73,6 @@ async def fetch_tmdb_data(tipo: str, titulo: str):
     if not TMDB_API_KEY: return "SIN_API_KEY"
     url = f"https://api.themoviedb.org/3/search/{tipo}?api_key={TMDB_API_KEY}&language=es-ES&query={titulo}"
     try:
-        # Límite de tiempo estricto para que no se quede colgado
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as resp:
@@ -96,7 +95,6 @@ class SeasonCB(CallbackData, prefix="season"): code: str
 class AdminCB(CallbackData, prefix="adm"): section: str
 class PublishCB(CallbackData, prefix="pub"): code: str
 class CheckSubCB(CallbackData, prefix="chksub"): payload: str = ""
-# 🚨 CORRECCIÓN AQUÍ: Quitamos el payload del botón de TMDB
 class TmdbSaveCB(CallbackData, prefix="tmdb"): tipo: str; tmdb_id: int
 
 # ================= VERIFICACIÓN DE SUSCRIPCIÓN =================
@@ -175,7 +173,6 @@ async def init_db():
             ALTER TABLE message_map ADD COLUMN IF NOT EXISTS used BOOLEAN DEFAULT FALSE;
             ALTER TABLE message_map ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
 
-            -- Reparación automática
             UPDATE content SET status = 'ready' WHERE file_id IS NOT NULL AND status != 'ready';
             UPDATE content SET status = 'ready' WHERE content_type = 'series' AND code IN (SELECT content_code FROM seasons) AND status != 'ready';
         """)
@@ -265,7 +262,10 @@ async def process_tmdb_query(message: types.Message, query_text: str):
     nombre = data.get("title") or data.get("name")
     sinopsis = data.get("overview") or "Sin sinopsis disponible."
     año = (data.get("release_date") or data.get("first_air_date") or "N/A")[:4]
-    generos = ", ".join([g["name"] for g in data.get("genres", [])])
+    
+    # 🚨 MODIFICACIÓN AQUÍ: Agregamos el # y quitamos espacios dentro del nombre del género
+    generos = ", ".join([f"#{g['name'].replace(' ', '')}" for g in data.get("genres", [])])
+    
     poster_path = data.get("poster_path")
     tmdb_id = data["id"]
     
@@ -291,7 +291,6 @@ async def process_tmdb_query(message: types.Message, query_text: str):
         f"▬ι𓆃__ ▬ι𓆃__ ▬ι𓆃 ____ ▬ι𓆃"
     )
 
-    # 🚨 AHORA SOLO ENVIAMOS TIPO Y ID EN EL BOTÓN
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="📤 Enviar al Canal de Almacenamiento", callback_data=TmdbSaveCB(tipo=tipo_tmdb, tmdb_id=tmdb_id).pack())
     ]])
@@ -326,7 +325,6 @@ async def process_tmdb_state(message: types.Message, state: FSMContext):
 async def on_tmdb_save(query: types.CallbackQuery, callback_data: TmdbSaveCB):
     await query.answer("Enviando al canal...")
     
-    # 🚨 COPIAMOS EL MENSAJE ORIGINAL (CON FOTO Y TEXTO) AL CANAL
     try:
         msg = await query.message.copy_to(chat_id=STORAGE_CHANNEL_ID)
     except Exception as e:
