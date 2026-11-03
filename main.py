@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import os
@@ -39,6 +40,7 @@ if not BOT_TOKEN or not DATABASE_URL:
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 db_pool: asyncpg.Pool = None
+validation_active = True # 🚨 Bandera para activar/desactivar validación
 
 # ================= ESTADOS (FSM) =================
 class AdminStates(StatesGroup):
@@ -262,10 +264,7 @@ async def process_tmdb_query(message: types.Message, query_text: str):
     nombre = data.get("title") or data.get("name")
     sinopsis = data.get("overview") or "Sin sinopsis disponible."
     año = (data.get("release_date") or data.get("first_air_date") or "N/A")[:4]
-    
-    # 🚨 MODIFICACIÓN AQUÍ: Agregamos el # y quitamos espacios dentro del nombre del género
     generos = ", ".join([f"#{g['name'].replace(' ', '')}" for g in data.get("genres", [])])
-    
     poster_path = data.get("poster_path")
     tmdb_id = data["id"]
     
@@ -947,7 +946,7 @@ async def lista(message: types.Message):
                     lines.append(f"   └─ <code>{s['code']}</code> ({cnt} eps)")
     await message.answer("📚 <b>Contenido</b>\n\n" + "\n".join(lines))
 
-# ================= TAREAS DE FONDO =================
+# ================= TAREAS DE FONDO (AHORA SEGURA) =================
 async def log_memory():
     while True:
         await asyncio.sleep(3600)
@@ -957,35 +956,54 @@ async def log_memory():
         except Exception: pass
 
 async def validate_file_ids():
+    global validation_active
     while True:
-        await asyncio.sleep(6 * 3600)
-        logging.info("🔍 Validando file_ids...")
+        await asyncio.sleep(6 * 3600) # Espera 6 horas
+        if not validation_active:
+            logging.info("⏸️ Validación omitida (desactivada por el admin).")
+            continue
+            
+        logging.info("🔍 Iniciando validación de archivos...")
         
-        invalid_items = []
+        # Solo guardaremos aquí los que Telegram diga 100% que no existen
+        dead_links = []
         
         async with db_pool.acquire() as conn:
-            for row in await conn.fetch("SELECT code, file_id FROM content WHERE file_id IS NOT NULL"):
+            # Revisar Películas
+            movies = await conn.fetch("SELECT code, file_id FROM content WHERE file_id IS NOT NULL")
+            for row in movies:
+                if not validation_active: break
                 try: 
                     await bot.get_file(row["file_id"])
-                    await asyncio.sleep(0.3)
-                except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
-                except TelegramBadRequest:
-                    invalid_items.append(f"🎬 <code>{row['code']}</code>")
+                    await asyncio.sleep(1.0) # Pausa MUY larga para evitar FloodWait
+                except TelegramRetryAfter as e: 
+                    logging.warning(f"FloodWait de {e.retry_after}s. Pausando validación...")
+                    await asyncio.sleep(e.retry_after)
+                except TelegramBadRequest as e:
+                    # Solo si Telegram dice explícitamente que no se encuentra
+                    if "file is not found" in str(e).lower() or "wrong file identifier" in str(e).lower():
+                        dead_links.append(f"🎬 <code>{row['code']}</code>")
                 except Exception: pass
             
-            for row in await conn.fetch("SELECT id, season_code, episode_number, file_id FROM episodes"):
+            # Revisar Episodios
+            episodes = await conn.fetch("SELECT id, season_code, episode_number, file_id FROM episodes")
+            for row in episodes:
+                if not validation_active: break
                 try: 
                     await bot.get_file(row["file_id"])
-                    await asyncio.sleep(0.3)
-                except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
-                except TelegramBadRequest:
-                    invalid_items.append(f"🎞 <code>{row['season_code']}</code> - Ep. {row['episode_number']}")
+                    await asyncio.sleep(1.0) # Pausa MUY larga
+                except TelegramRetryAfter as e: 
+                    logging.warning(f"FloodWait de {e.retry_after}s. Pausando validación...")
+                    await asyncio.sleep(e.retry_after)
+                except TelegramBadRequest as e:
+                    if "file is not found" in str(e).lower() or "wrong file identifier" in str(e).lower():
+                        dead_links.append(f"🎞 <code>{row['season_code']}</code> - Ep. {row['episode_number']}")
                 except Exception: pass
 
-        if invalid_items:
-            msg = "⚠️ <b>Se detectaron archivos inválidos/caducados:</b>\n\n" + "\n".join(invalid_items[:30])
-            if len(invalid_items) > 30: msg += f"\n... y {len(invalid_items)-30} más."
-            msg += "\n\n<i>Usa /borrar o /borrar_episodio si quieres eliminarlos.</i>"
+        if dead_links:
+            msg = "⚠️ <b>Se ha detectado que los siguientes archivos ya no existen en Telegram (o fueron borrados de tus servidores):</b>\n\n" + "\n".join(dead_links[:30])
+            if len(dead_links) > 30: msg += f"\n... y {len(dead_links)-30} más."
+            msg += "\n\n<i>Si los tocas en el canal, el bot seguirá intentando enviarlos. Si quieres limpiarlos, usa /borrar o /borrar_episodio.</i>"
             try: await bot.send_message(ADMIN_ID, msg)
             except: pass
             
