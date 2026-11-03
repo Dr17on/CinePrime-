@@ -73,15 +73,17 @@ async def fetch_tmdb_data(tipo: str, titulo: str):
     if not TMDB_API_KEY: return "SIN_API_KEY"
     url = f"https://api.themoviedb.org/3/search/{tipo}?api_key={TMDB_API_KEY}&language=es-ES&query={titulo}"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as resp:
+        # Límite de tiempo estricto para que no se quede colgado
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
                 if resp.status != 200: return None
                 data = await resp.json()
                 if not data.get("results"): return None
                 item = data["results"][0]
                 
                 detail_url = f"https://api.themoviedb.org/3/{tipo}/{item['id']}?api_key={TMDB_API_KEY}&language=es-ES"
-                async with session.get(detail_url, timeout=10) as detail_resp:
+                async with session.get(detail_url) as detail_resp:
                     return await detail_resp.json()
     except Exception as e:
         logging.error(f"Error TMDB: {e}")
@@ -94,7 +96,8 @@ class SeasonCB(CallbackData, prefix="season"): code: str
 class AdminCB(CallbackData, prefix="adm"): section: str
 class PublishCB(CallbackData, prefix="pub"): code: str
 class CheckSubCB(CallbackData, prefix="chksub"): payload: str = ""
-class TmdbSaveCB(CallbackData, prefix="tmdb"): tipo: str; tmdb_id: int; payload: str
+# 🚨 CORRECCIÓN AQUÍ: Quitamos el payload del botón de TMDB
+class TmdbSaveCB(CallbackData, prefix="tmdb"): tipo: str; tmdb_id: int
 
 # ================= VERIFICACIÓN DE SUSCRIPCIÓN =================
 async def check_sub(user_id: int) -> bool:
@@ -172,10 +175,8 @@ async def init_db():
             ALTER TABLE message_map ADD COLUMN IF NOT EXISTS used BOOLEAN DEFAULT FALSE;
             ALTER TABLE message_map ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
 
-            -- 🚨 REPARACIÓN AUTOMÁTICA DE ESTADOS 🚨
-            -- Arregla las películas que tienen video pero estaban marcadas como pendientes/inválidas
+            -- Reparación automática
             UPDATE content SET status = 'ready' WHERE file_id IS NOT NULL AND status != 'ready';
-            -- Arregla las series que tienen temporadas pero estaban marcadas como pendientes/inválidas
             UPDATE content SET status = 'ready' WHERE content_type = 'series' AND code IN (SELECT content_code FROM seasons) AND status != 'ready';
         """)
 
@@ -290,8 +291,9 @@ async def process_tmdb_query(message: types.Message, query_text: str):
         f"▬ι𓆃__ ▬ι𓆃__ ▬ι𓆃 ____ ▬ι𓆃"
     )
 
+    # 🚨 AHORA SOLO ENVIAMOS TIPO Y ID EN EL BOTÓN
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📤 Enviar al Canal de Almacenamiento", callback_data=TmdbSaveCB(tipo=tipo_tmdb, tmdb_id=tmdb_id, payload=texto).pack())
+        InlineKeyboardButton(text="📤 Enviar al Canal de Almacenamiento", callback_data=TmdbSaveCB(tipo=tipo_tmdb, tmdb_id=tmdb_id).pack())
     ]])
 
     await status_msg.delete()
@@ -324,11 +326,9 @@ async def process_tmdb_state(message: types.Message, state: FSMContext):
 async def on_tmdb_save(query: types.CallbackQuery, callback_data: TmdbSaveCB):
     await query.answer("Enviando al canal...")
     
+    # 🚨 COPIAMOS EL MENSAJE ORIGINAL (CON FOTO Y TEXTO) AL CANAL
     try:
-        if query.message.photo:
-            msg = await query.message.copy_to(chat_id=STORAGE_CHANNEL_ID)
-        else:
-            msg = await bot.send_message(chat_id=STORAGE_CHANNEL_ID, text=query.message.text)
+        msg = await query.message.copy_to(chat_id=STORAGE_CHANNEL_ID)
     except Exception as e:
         return await query.message.edit_text(f"❌ Error al enviar al canal: {e}")
 
@@ -583,7 +583,6 @@ async def deliver_by_code(chat_id: int, code: str):
         content = await conn.fetchrow("SELECT * FROM content WHERE code=$1", code)
         if not content: return await bot.send_message(chat_id, "❌ Contenido no encontrado.")
         
-        # Verificación de seguridad inteligente: si tiene file_id o es serie, intentamos enviar
         if content["content_type"] == "movie" and not content["file_id"]:
             return await bot.send_message(chat_id, "⚠️ Este contenido aún no está disponible.")
 
@@ -973,7 +972,6 @@ async def validate_file_ids():
                     await asyncio.sleep(0.3)
                 except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
                 except TelegramBadRequest:
-                    # Ya NO cambia el estado a inválido automáticamente para evitar romper las pelis
                     invalid_items.append(f"🎬 <code>{row['code']}</code>")
                 except Exception: pass
             
