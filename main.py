@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -40,7 +39,7 @@ if not BOT_TOKEN or not DATABASE_URL:
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 db_pool: asyncpg.Pool = None
-validation_active = True # 🚨 Bandera para activar/desactivar validación
+validation_active = True
 
 # ================= ESTADOS (FSM) =================
 class AdminStates(StatesGroup):
@@ -98,6 +97,7 @@ class AdminCB(CallbackData, prefix="adm"): section: str
 class PublishCB(CallbackData, prefix="pub"): code: str
 class CheckSubCB(CallbackData, prefix="chksub"): payload: str = ""
 class TmdbSaveCB(CallbackData, prefix="tmdb"): tipo: str; tmdb_id: int
+class ConfirmDupCB(CallbackData, prefix="dup"): action: str; code: str; tipo: str = ""; tmdb_id: int = 0
 
 # ================= VERIFICACIÓN DE SUSCRIPCIÓN =================
 async def check_sub(user_id: int) -> bool:
@@ -243,6 +243,24 @@ async def send_formatted_post(chat_id: int, code: str):
         logging.error(f"Error enviando post {code}: {e}")
         return False
 
+async def send_to_storage_and_map(code: str, text: str, photo_id: str = None):
+    try:
+        if photo_id:
+            msg = await bot.send_photo(STORAGE_CHANNEL_ID, photo=photo_id, caption=text)
+        else:
+            msg = await bot.send_message(STORAGE_CHANNEL_ID, text=text)
+            
+        reply = await msg.reply(f"⬆️ <b>Responde a ESTE mensaje (o al post de arriba) con el video.</b>\nCódigo: <code>{code}</code>")
+        
+        # Mapeamos ambos mensajes (el post y la respuesta) para que reconozca el video sin importar a cuál respondas
+        async with db_pool.acquire() as conn:
+            await conn.execute("INSERT INTO message_map (bot_message_id, target_code, target_type) VALUES ($1,$2,'description')", msg.message_id, code)
+            await conn.execute("INSERT INTO message_map (bot_message_id, target_code, target_type) VALUES ($1,$2,'description')", reply.message_id, code)
+        return True
+    except Exception as e:
+        logging.error(f"Error enviando al storage: {e}")
+        return False
+
 # ================= LÓGICA TMDB =================
 async def process_tmdb_query(message: types.Message, query_text: str):
     parts = query_text.strip().split(maxsplit=1)
@@ -253,13 +271,13 @@ async def process_tmdb_query(message: types.Message, query_text: str):
     tipo_tmdb = "movie" if tipo_raw in ["peli", "pelicula", "película", "movie"] else "tv"
     
     status_msg = await message.answer("⏳ Buscando en TMDB...")
-    
     data = await fetch_tmdb_data(tipo_tmdb, titulo)
     
     if data == "SIN_API_KEY":
-        return await status_msg.edit_text("❌ Falta configurar `TMDB_API_KEY` en las variables de entorno de BotKeep.")
+        return await status_msg.edit_text("❌ Falta configurar `TMDB_API_KEY` en las variables de entorno.")
     if not data:
-        return await status_msg.edit_text("❌ No se encontró el contenido en TMDB o hubo un error de conexión. Intenta de nuevo.")
+        # Si falla, NO cerramos el estado. El usuario puede volver a escribir otro nombre.
+        return await status_msg.edit_text("❌ No se encontró en TMDB. Escribe otro nombre para volver a buscar, o envía /cancelar para salir.")
         
     nombre = data.get("title") or data.get("name")
     sinopsis = data.get("overview") or "Sin sinopsis disponible."
@@ -317,42 +335,92 @@ async def process_tmdb_state(message: types.Message, state: FSMContext):
     if message.text == "/cancelar":
         await state.clear()
         return await message.answer("❌ Búsqueda cancelada.", reply_markup=admin_panel_kb())
-    await state.clear()
+    
+    # 🚨 CORRECCIÓN: Ya NO hacemos state.clear() aquí. Mantenemos el estado para que pueda buscar otra.
     await process_tmdb_query(message, message.text)
 
-@dp.callback_query(TmdbSaveCB.filter(), IsAdmin())
-async def on_tmdb_save(query: types.CallbackQuery, callback_data: TmdbSaveCB):
-    await query.answer("Enviando al canal...")
+# ================= GUARDADO CON DETECCIÓN DE DUPLICADOS =================
+async def process_tmdb_save_success(message: types.Message, tipo: str, tmdb_id: int, text: str, code: str):
+    photo_id = message.photo[-1].file_id if message.photo else None
+    title = text.split("\n")[0].replace("🧃Película:", "").replace("🧃Serie:", "").replace("🧃Anime:", "").strip()
     
-    try:
-        msg = await query.message.copy_to(chat_id=STORAGE_CHANNEL_ID)
-    except Exception as e:
-        return await query.message.edit_text(f"❌ Error al enviar al canal: {e}")
-
-    code = f"peli_{msg.message_id}"
-    texto_completo = query.message.caption or query.message.text
-    title = texto_completo.split("\n")[0].replace("🧃Película:", "").replace("🧃Serie:", "").replace("🧃Anime:", "").strip()
-    photo_id = msg.photo[-1].file_id if msg.photo else None
-
+    await send_to_storage_and_map(code, text, photo_id)
+    
     async with db_pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO content (code, title, description_text, description_photo_id, status, tmdb_id, content_type)
                VALUES ($1,$2,$3,$4,'pending',$5,$6)
                ON CONFLICT (code) DO UPDATE SET description_text=EXCLUDED.description_text""",
-            code, title, texto_completo, photo_id, callback_data.tmdb_id, callback_data.tipo
+            code, title, text, photo_id, tmdb_id, tipo
         )
-        reply = await bot.send_message(
-            chat_id=STORAGE_CHANNEL_ID,
-            text=f"⬆️ <b>Responde a este mensaje con el video.</b>\nCódigo: <code>{code}</code>"
+        
+    success_text = text + "\n\n✅ <b>Enviado al canal. Responde en el canal con el video.</b>"
+    if message.photo: await message.edit_caption(caption=success_text, reply_markup=None)
+    else: await message.edit_text(text=success_text, reply_markup=None)
+
+async def execute_manual_save(message: types.Message, code: str, text: str, photo_id: str = None, tags: str = ""):
+    title = text.split("\n")[0][:150].strip() or f"Contenido {message.message_id}"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO content (code, title, description_text, description_photo_id, tags, status)
+               VALUES ($1,$2,$3,$4,$5,'pending')
+               ON CONFLICT (code) DO UPDATE SET
+                 title=EXCLUDED.title, description_text=EXCLUDED.description_text,
+                 description_photo_id=EXCLUDED.description_photo_id, tags=EXCLUDED.tags""",
+            code, title, text, photo_id, tags
         )
+    
+    # Como el mensaje original ya está en el canal, solo le respondemos pidiendo el video
+    reply = await message.reply(f"⬆️ <b>Responde a ESTE mensaje con el video/documento.</b>\nCódigo: <code>{code}</code>\n\n<i>(Si es serie, usa /season 1)</i>")
+    async with db_pool.acquire() as conn:
+        await conn.execute("INSERT INTO message_map (bot_message_id, target_code, target_type) VALUES ($1,$2,'description')", message.message_id, code)
         await conn.execute("INSERT INTO message_map (bot_message_id, target_code, target_type) VALUES ($1,$2,'description')", reply.message_id, code)
 
-    try:
-        if query.message.photo:
-            await query.message.edit_caption(caption=texto_completo + "\n\n✅ <b>Enviado al canal. Responde allí con el video.</b>", reply_markup=None)
-        else:
-            await query.message.edit_text(text=texto_completo + "\n\n✅ <b>Enviado al canal. Responde allí con el video.</b>", reply_markup=None)
-    except: pass
+@dp.callback_query(TmdbSaveCB.filter(), IsAdmin())
+async def on_tmdb_save(query: types.CallbackQuery, callback_data: TmdbSaveCB):
+    await query.answer("Procesando...")
+    texto_completo = query.message.caption or query.message.text
+    title = texto_completo.split("\n")[0].replace("🧃Película:", "").replace("🧃Serie:", "").replace("🧃Anime:", "").strip()
+
+    # 🚨 Detección de duplicado
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow("SELECT code FROM content WHERE LOWER(title) = LOWER($1) AND status='ready'", title)
+    
+    if existing:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Continuar de todos modos", callback_data=ConfirmDupCB(action="yes_tmdb", code=f"peli_{query.message.message_id}", tipo=callback_data.tipo, tmdb_id=callback_data.tmdb_id).pack())],
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data=ConfirmDupCB(action="no", code="").pack())]
+        ])
+        warn_text = f"\n\n⚠️ <b>¡Atención!</b> Ya existe un contenido con este título (<code>{existing['code']}</code>). ¿Deseas agregarlo de todos modos?"
+        if query.message.photo: await query.message.edit_caption(caption=texto_completo + warn_text, reply_markup=kb)
+        else: await query.message.edit_text(text=texto_completo + warn_text, reply_markup=kb)
+        return
+
+    await process_tmdb_save_success(query.message, callback_data.tipo, callback_data.tmdb_id, texto_completo, f"peli_{query.message.message_id}")
+
+@dp.callback_query(ConfirmDupCB.filter(), IsAdmin())
+async def on_dup_confirm(query: types.CallbackQuery, callback_data: ConfirmDupCB):
+    if callback_data.action == "no":
+        await query.answer("Cancelado.")
+        try: await query.message.delete()
+        except: pass
+        return
+    
+    await query.answer("Continuando...")
+    texto_completo = query.message.caption or query.message.text
+    clean_text = texto_completo.split("\n\n⚠️")[0] # Limpiamos el aviso
+    
+    if callback_data.action == "yes_tmdb":
+        await process_tmdb_save_success(query.message, callback_data.tipo, callback_data.tmdb_id, clean_text, callback_data.code)
+        
+    elif callback_data.action == "yes_manual":
+        original_msg = query.message.reply_to_message
+        if not original_msg: return
+        text = original_msg.text or original_msg.caption or ""
+        photo_id = original_msg.photo[-1].file_id if original_msg.photo else None
+        tags = " ".join(w for w in text.split() if w.startswith("#")).lower()
+        await execute_manual_save(original_msg, callback_data.code, text, photo_id, tags)
+        await query.message.delete()
 
 # ================= CANAL PRIVADO =================
 @dp.channel_post(F.chat.id == STORAGE_CHANNEL_ID)
@@ -375,29 +443,22 @@ async def handle_storage(message: types.Message):
 async def handle_description(message: types.Message):
     text = message.text or message.caption or ""
     code = f"peli_{message.message_id}"
-    first_line = text.split("\n")[0][:150].strip()
-    title = first_line if first_line else f"Contenido {message.message_id}"
+    title = text.split("\n")[0][:150].strip() or f"Contenido {message.message_id}"
+
+    # 🚨 Detección de duplicado
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow("SELECT code FROM content WHERE LOWER(title) = LOWER($1) AND status='ready'", title)
+    
+    if existing:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Continuar de todos modos", callback_data=ConfirmDupCB(action="yes_manual", code=code).pack())],
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data=ConfirmDupCB(action="no", code="").pack())]
+        ])
+        return await message.reply(f"⚠️ <b>Ya existe un contenido con este título:</b>\n<code>{existing['code']}</code> — {title}\n\n¿Deseas agregarlo igualmente (se creará otro código)?", reply_markup=kb)
+
     photo_id = message.photo[-1].file_id if message.photo else None
     tags = " ".join(w for w in text.split() if w.startswith("#")).lower()
-
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO content (code, title, description_text, description_photo_id, tags, status)
-               VALUES ($1,$2,$3,$4,$5,'pending')
-               ON CONFLICT (code) DO UPDATE SET
-                 title=EXCLUDED.title, description_text=EXCLUDED.description_text,
-                 description_photo_id=EXCLUDED.description_photo_id, tags=EXCLUDED.tags""",
-            code, title, text, photo_id, tags,
-        )
-
-    reply = await message.reply(
-        f"✅ Descripción guardada.\nCódigo: <code>{code}</code>\n\n"
-        f"👉 Ahora reenvía el video/documento:\n"
-        f"• Como <b>respuesta</b> a este mensaje, o\n"
-        f"• Directamente (se vinculará solo en los próximos 10 min)\n"
-        f"• Si es serie: responde con <code>/season N</code>"
-    )
-    await save_confirmation(reply.message_id, code, "description")
+    await execute_manual_save(message, code, text, photo_id, tags)
 
 async def handle_content(message: types.Message):
     target = None
@@ -946,7 +1007,7 @@ async def lista(message: types.Message):
                     lines.append(f"   └─ <code>{s['code']}</code> ({cnt} eps)")
     await message.answer("📚 <b>Contenido</b>\n\n" + "\n".join(lines))
 
-# ================= TAREAS DE FONDO (AHORA SEGURA) =================
+# ================= TAREAS DE FONDO =================
 async def log_memory():
     while True:
         await asyncio.sleep(3600)
@@ -958,42 +1019,34 @@ async def log_memory():
 async def validate_file_ids():
     global validation_active
     while True:
-        await asyncio.sleep(6 * 3600) # Espera 6 horas
+        await asyncio.sleep(6 * 3600)
         if not validation_active:
-            logging.info("⏸️ Validación omitida (desactivada por el admin).")
             continue
             
         logging.info("🔍 Iniciando validación de archivos...")
-        
-        # Solo guardaremos aquí los que Telegram diga 100% que no existen
         dead_links = []
         
         async with db_pool.acquire() as conn:
-            # Revisar Películas
             movies = await conn.fetch("SELECT code, file_id FROM content WHERE file_id IS NOT NULL")
             for row in movies:
                 if not validation_active: break
                 try: 
                     await bot.get_file(row["file_id"])
-                    await asyncio.sleep(1.0) # Pausa MUY larga para evitar FloodWait
+                    await asyncio.sleep(1.0)
                 except TelegramRetryAfter as e: 
-                    logging.warning(f"FloodWait de {e.retry_after}s. Pausando validación...")
                     await asyncio.sleep(e.retry_after)
                 except TelegramBadRequest as e:
-                    # Solo si Telegram dice explícitamente que no se encuentra
                     if "file is not found" in str(e).lower() or "wrong file identifier" in str(e).lower():
                         dead_links.append(f"🎬 <code>{row['code']}</code>")
                 except Exception: pass
             
-            # Revisar Episodios
             episodes = await conn.fetch("SELECT id, season_code, episode_number, file_id FROM episodes")
             for row in episodes:
                 if not validation_active: break
                 try: 
                     await bot.get_file(row["file_id"])
-                    await asyncio.sleep(1.0) # Pausa MUY larga
+                    await asyncio.sleep(1.0)
                 except TelegramRetryAfter as e: 
-                    logging.warning(f"FloodWait de {e.retry_after}s. Pausando validación...")
                     await asyncio.sleep(e.retry_after)
                 except TelegramBadRequest as e:
                     if "file is not found" in str(e).lower() or "wrong file identifier" in str(e).lower():
@@ -1001,9 +1054,9 @@ async def validate_file_ids():
                 except Exception: pass
 
         if dead_links:
-            msg = "⚠️ <b>Se ha detectado que los siguientes archivos ya no existen en Telegram (o fueron borrados de tus servidores):</b>\n\n" + "\n".join(dead_links[:30])
+            msg = "⚠️ <b>Se ha detectado que los siguientes archivos ya no existen en Telegram (o fueron borrados):</b>\n\n" + "\n".join(dead_links[:30])
             if len(dead_links) > 30: msg += f"\n... y {len(dead_links)-30} más."
-            msg += "\n\n<i>Si los tocas en el canal, el bot seguirá intentando enviarlos. Si quieres limpiarlos, usa /borrar o /borrar_episodio.</i>"
+            msg += "\n\n<i>Si los tocas en el canal, el bot intentará enviarlos. Si quieres limpiarlos, usa /borrar o /borrar_episodio.</i>"
             try: await bot.send_message(ADMIN_ID, msg)
             except: pass
             
